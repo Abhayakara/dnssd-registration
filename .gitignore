@@ -1,0 +1,4 @@
+*.o
+*~
+srp-simple
+srp-gw
