@@ -26,10 +26,20 @@
 //      a different key.
 //   6. Send back the response
 
+#define __APPLE_USE_RFC_3542
+
 #include "dns-msg.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/errno.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/event.h>
+
+#pragma mark structures
 
 typedef struct addr addr_t;
 struct addr {
@@ -54,20 +64,45 @@ struct udp_validator {
     subnet_t *subnets;
 };
 
+typedef struct message message_t;
+struct message {
+    addr_t src;
+    size_t len;
+    int ifindex;
+    size_t length;
+    dns_wire_t wire;
+};
+
 typedef struct comm comm_t;
+typedef void (*read_callback_t)(comm_t *comm);
+typedef void (*write_callback_t)(comm_t *comm);
+typedef void (*datagram_callback_t)(comm_t *comm);
+typedef void (*close_callback_t)(comm_t *comm);
 struct comm {
     comm_t *next;
-    addr_t *address;
     const char *name;
+    read_callback_t read_callback;
+    write_callback_t write_callback;
+    datagram_callback_t datagram_callback;
+    datagram_callback_t close_callback;
+    message_t *message;
+    uint8_t *buf;
+    addr_t address;
+    size_t message_length_len;
+    size_t message_length, message_cur;
     int sock;
+    uint8_t message_length_bytes[2];
 };
     
+
+#pragma mark Globals
 comm_t *comms;
+int kq;
 
 static int
 usage(const char *progname)
 {
-    fprintf(stderr, "usage: %s -s <addr> <port> -t <subnet> ... -u <ifname> <subnet> ...\n");
+    fprintf(stderr, "usage: %s -s <addr> <port> -t <subnet> ... -u <ifname> <subnet> ...\n", progname);
     fprintf(stderr, "  -s can only appear once.\n");
     fprintf(stderr, "  -t can only appear once, and is followed by one or more subnets.\n");
     fprintf(stderr, "  -u can appear more than once, is followed by one interface name, and\n");
@@ -83,16 +118,27 @@ usage(const char *progname)
 int
 getipaddr(addr_t *addr, const char *p)
 {
-    if (inet_pton(AF_INET, argv[i], &server.sin.sin_addr)) {
-        addr.sa.sa_family = AF_INET;
-        return sizeof server.sin;
-    }  else if (inet_pton(AF_INET6, argv[i], &server.sin6.sin6_addr)) {
-        addr.sa.sa_family = AF_INET6;
-        return sizeof server.sin6;
+    if (inet_pton(AF_INET, p, &addr->sin.sin_addr)) {
+        addr->sa.sa_family = AF_INET;
+        return sizeof addr->sin;
+    }  else if (inet_pton(AF_INET6, p, &addr->sin6.sin6_addr)) {
+        addr->sa.sa_family = AF_INET6;
+        return sizeof addr->sin6;
     } else {
         return 0;
     }
 }                
+
+message_t *
+message_allocate(size_t message_size)
+{
+    message_t *message = (message_t *)malloc(message_size + (sizeof (message_t)) - (sizeof (dns_wire_t)));
+    if (message)
+        memset(message, 0, (sizeof (message_t)) - (sizeof (dns_wire_t)));
+    return message;
+}
+
+
 
 void
 add_reader(comm_t *comm, read_callback_t callback)
@@ -101,8 +147,8 @@ add_reader(comm_t *comm, read_callback_t callback)
 #else // use kqueue
     struct kevent ev;
     int rv;
-    EV_SET(&ev, (uintptr_t)&comm->sock, EV_ADD, EVFILT_READ, 0, comm);
-    rv = kevent(kq, &ev, 1, NULL, 0, NULL, NULL);
+    EV_SET(&ev, (uintptr_t)&comm->sock, EV_ADD, EVFILT_READ, 0, 0, comm);
+    rv = kevent(kq, &ev, 1, NULL, 0, NULL);
     if (rv < 0) {
         fprintf(stderr, "kevent: %s\n", strerror(errno));
         return;
@@ -112,17 +158,17 @@ add_reader(comm_t *comm, read_callback_t callback)
     comm->read_callback = callback;
 }
 
-void dispatch_events(struct timeval *timeout)
+void dispatch_events(struct timespec *timeout)
 {
 #ifdef USE_EPOLL
 #else // use kqueue
 #define KEV_MAX 1
     struct kevent evs[KEV_MAX];
-    comm_t comm;
+    comm_t *comm;
     int nev, i;
-    nev = kevent(kq, NULL, 0, evs, KEV_MAX, NULL, 0, timeout);
+    nev = kevent(kq, NULL, 0, evs, KEV_MAX, timeout);
     if (nev < 0) {
-        fprintf(stderr, "kevent: %s\n", sterror(errno));
+        fprintf(stderr, "kevent: %s\n", strerror(errno));
         exit(1);
     }
     for (i = 0; i < nev; i++) {
@@ -140,8 +186,6 @@ void dispatch_events(struct timeval *timeout)
 #endif
 }
 
-
-
 void
 udp_read_callback(comm_t *connection)
 {
@@ -149,15 +193,17 @@ udp_read_callback(comm_t *connection)
     int rv;
     struct msghdr msg;
     struct iovec bufp;
-    uint8_t message[DNS_MAX_UDP_PAYLOAD];
+    uint8_t msgbuf[DNS_MAX_UDP_PAYLOAD];
     char cmsgbuf[128];
     struct cmsghdr *cmh;
     message_t *message;
 
-    bufp.iov_base = connection->message;
+    bufp.iov_base = msgbuf;
     bufp.iov_len = DNS_MAX_UDP_PAYLOAD;
-    msg.name = &src;
-    msg.namelen = sizeof src;
+    msg.msg_iov = &bufp;
+    msg.msg_iovlen = 1;
+    msg.msg_name = &src;
+    msg.msg_namelen = sizeof src;
     msg.msg_control = cmsgbuf;
     msg.msg_controllen = sizeof cmsgbuf;
     
@@ -166,17 +212,18 @@ udp_read_callback(comm_t *connection)
         fprintf(stderr, "udp_read_callback: %s\n", strerror(errno));
         return;
     }
-    message = (message_t *)malloc(rv + sizeof message_t);
+    message = message_allocate(rv);
     if (!message) {
         fprintf(stderr, "udp_read_callback: out of memory\n");
         return;
     }
     memcpy(&message->src, &src, sizeof src);
     message->length = rv;
+    memcpy(&message->wire, msgbuf, rv);
     
     // For UDP, we use the interface index as part of the validation strategy, so go get
     // the interface index.
-    for (cmh = CMSG_FIRSTHDR(&mh); cmh; cmh = CMSG_NXTHDR(&mh, cmh)) {
+    for (cmh = CMSG_FIRSTHDR(&msg); cmh; cmh = CMSG_NXTHDR(&msg, cmh)) {
         if (cmh->cmsg_level == IPPROTO_IPV6 && cmh->cmsg_type == IPV6_PKTINFO) {
             struct in6_pktinfo pktinfo;    
 
@@ -233,16 +280,18 @@ tcp_read_callback(comm_t *connection)
 
     // If we only just got the length, we need to allocate a message
     if (connection->message == NULL) {
-        connection->message = (message_t *)malloc(rv + sizeof message_t);
+        connection->message = message_allocate(rv);
         if (!connection->message) {
             fprintf(stderr, "udp_read_callback: out of memory\n");
             return;
         }
-        connection->message.length = connection->message_length;
-        memset(&connection->message.src, 0, sizeof connection->message.src);
+        connection->buf = (uint8_t *)&connection->message->wire;
+        connection->message->length = connection->message_length;
+        memset(&connection->message->src, 0, sizeof connection->message->src);
     }
 
-    rv = read(connection, &connection->message.buf[connection->message_cur], connection->message_length - connection->message_cur);
+    rv = read(connection->sock, &connection->buf[connection->message_cur],
+              connection->message_length - connection->message_cur);
     if (rv < 0) {
         goto read_error;
     }
@@ -263,10 +312,10 @@ listen_callback(comm_t *listener)
 {
     int rv;
     addr_t addr;
-    socklen_t addr_len = sizeof com->address;
+    socklen_t addr_len = sizeof addr;
     comm_t *comm;
 
-    rv = accept(listener->sock, &addr, &addr_len);
+    rv = accept(listener->sock, &addr.sa, &addr_len);
     if (rv < 0) {
         fprintf(stderr, "accept: %s\n", strerror(errno));
         close(listener->sock);
@@ -287,6 +336,7 @@ setup_listener_socket(int family, int protocol, const char *name)
 {
     addr_t addr;
     comm_t *listener;
+    socklen_t sl;
     
     listener = calloc(1, sizeof *listener);
     if (listener == NULL) {
@@ -304,11 +354,18 @@ setup_listener_socket(int family, int protocol, const char *name)
         return NULL;
     }
     memset(&addr, 0, sizeof addr);
-    addr.sin.sin_family = AF_INET;
-    addr.sin.sin_len = sizeof addr.sin;
-    addr.sin.sin_port = htons(53);
-    if (bind(listener->sock, &addr, sizeof addr.sin)) {
-        fprintf(stderr, "Can't bind to 0#53/%s%s.\n", protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6");
+    if (family == AF_INET) {
+        sl = sizeof addr.sin;
+        addr.sin.sin_port = htons(53);
+    } else {
+        sl = sizeof addr.sin6;
+        addr.sin6.sin6_port = htons(53);
+    }
+    addr.sin.sa_family = family;
+    addr.sin.sa_len = sizeof addr.sin;
+    if (bind(listener->sock, &addr.sa, sizeof addr.sin)) {
+        fprintf(stderr, "Can't bind to 0#53/%s%s.\n",
+                protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6");
     out:
         close(listener->sock);
         free(listener);
@@ -317,14 +374,16 @@ setup_listener_socket(int family, int protocol, const char *name)
 
     if (protocol == IPPROTO_TCP) {
         if (listen(listener->sock, 5 /* xxx */)  0) {
-            fprintf(stderr, "Can't listen on 0#53/%s%s.\n", protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6");
+            fprintf(stderr, "Can't listen on 0#53/%s%s.\n",
+                    protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6");
             goto out;
         }                
         add_reader(comm, listen_callback);
     } else {
         int rv;
         int flag = 1;
-        rv = setsockopt(comm->sock, IPPROTO_IP, family == AF_INET ? IP_PKTINFO : IPV6_RECVPKTINFO, &flag, sizeof flag);
+        rv = setsockopt(comm->sock, IPPROTO_IP,
+                        family == AF_INET ? IP_PKTINFO : IPV6_RECVPKTINFO, &flag, sizeof flag);
         add_reader(comm, udp_read_callback);
     }
 
@@ -352,39 +411,39 @@ main(int argc, char **argv)
         if (!strcmp(argv[i], "-s")) {
             if (i++ == argc) {
                 fprintf(stderr, "-s is missing server IP address.\n");
-                return usage();
+                return usage(argv[0]);
             }
             len = getipaddr(&server, argv[i]);
             if (!len) {
                 fprintf(stderr, "Invalid IP address: %s.\n", argv[i]);
-                return usage();
+                return usage(argv[0]);
             }
             addr.sa.sa_len = len;
             if (i++ == argc) {
                 fprintf(stderr, "-s is missing server port.\n");
-                return usage();
+                return usage(argv[0]);
             }
             port = strtol(10, argv[i], &s);
             if (s == argv[i] || s[0] != '\0') {
                 fprintf(stderr, "Invalid port number: %s\n", argv[i]);
-                return usage();
+                return usage(argv[0]);
             }
             i += 2;
         } else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "-u")) {
             if (!strcmp(argv[i], "-u")) {
                 if (i++ == argc) {
                     fprintf("-u is missing interface name.\n");
-                    return usage();
+                    return usage(argv[0]);
                 }
                 *up = calloc(1, sizeof **up);
                 if (*up == NULL) {
                     fprintf("out of memory.\n");
-                 	return usage();
+                 	return usage(argv[0]);
                 }
                 (*up)->ifname = strdup(argv[i]);
                 if ((*up)->ifname == NULL) {
                     fprintf("out of memory.\n");
-                    return usage();
+                    return usage(argv[0]);
                 }
                 sp = &((*up)->subnets);
             } else {
@@ -393,31 +452,31 @@ main(int argc, char **argv)
 
             if (i++ == argc) {
                 fprintf(stderr, "%s requires at least one prefix.\n");
-                return usage();
+                return usage(argv[0]);
             }
             s = strchr(argv[i], '/');
             if (p == NULL) {
                 fprintf(stderr, "%s is not a prefix.\n", argv[i]);
-                return usage();
+                return usage(argv[0]);
             }
             *p = 0;
             ++p;
             prefalen = getipaddr(&pref, argv[i]);
             if (!prefalen) {
                 fprintf(stderr, "%s is not a valid prefix address.\n", argv[i]);
-                return usage();
+                return usage(argv[0]);
             }
             width = strtol(10, p, &s);
             if (s == p || s[0] != '\0') {
                 fprintf(stderr, "%s (prefix width) is not a number.\n", p);
-                return usage();
+                return usage(argv[0]);
             }
             if (width < 0 ||
                 (pref.sa.sa_family == AF_INET && width > 32) ||
                 (pref.sa.sa_family == AF_INET6 && width > 64)) {
                 fprintf(stderr, "%s is not a valid prefix length for %s\n", p,
                         pref.sa.sa_family == AF_INET ? "IPv4" : "IPv6");
-                return usage();
+                return usage(argv[0]);
             }
 
             *nt = calloc(1, sizeof **nt);
@@ -442,6 +501,12 @@ main(int argc, char **argv)
                 nt = sp;
             }
         }
+    }
+
+    kq = kqueue();
+    if (kq < 0) {
+        fprintf(stderr, "kqueue(): %s\n", strerror(errno));
+        return 1;
     }
 
     // Set up listeners

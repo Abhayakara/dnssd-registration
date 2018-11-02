@@ -209,7 +209,7 @@ main(int argc, char **argv)
     //   SIG(0)
     
     message.adcount = htons(1);
-    dns_edns0_header_to_wire(&txn, DNS_MAX_WIRE_PAYLOAD, 0, 0, 1); CH;	// XRCODE = 0; VERSION = 0; DO=1
+    dns_edns0_header_to_wire(&txn, DNS_MAX_UDP_PAYLOAD, 0, 0, 1); CH;	// XRCODE = 0; VERSION = 0; DO=1
     dns_rdlength_begin(&txn); CH;
     dns_ui16_to_wire(&txn, dns_opt_update_lease); CH;  // OPTION-CODE
     dns_edns0_option_begin(&txn); CH;                 // OPTION-LENGTH
@@ -222,6 +222,7 @@ main(int argc, char **argv)
 
     // Send the update
     if (dns_send_to_server(&txn, anycast_address, dns_response_callback) < 0) {
+    fail:
         printf("dns_send_to_server failed: %s at line %d\n", strerror(txn.error), line);
     }
 }
