@@ -41,8 +41,8 @@
 
 #pragma mark structures
 
-typedef struct addr addr_t;
-struct addr {
+typedef union addr addr_t;
+union addr {
     struct sockaddr sa;
     struct sockaddr_in sin;
     struct sockaddr_in6 sin6;
@@ -178,11 +178,12 @@ add_reader(comm_t *comm, read_callback_t callback)
     comm->read_callback = callback;
 }
 
-void dispatch_events(struct timespec *timeout)
+int dispatch_events(struct timespec *timeout)
 {
 #ifdef USE_EPOLL
 #else // use kqueue
 #define KEV_MAX 1
+    int nevents = 0;
     struct kevent evs[KEV_MAX];
     comm_t *comm;
     int nev, i;
@@ -194,16 +195,19 @@ void dispatch_events(struct timespec *timeout)
     for (i = 0; i < nev; i++) {
         comm = evs[i].udata;
 
-        if (evs[i].fflags & EVFILT_WRITE) {
+        if (evs[i].flags & EVFILT_WRITE) {
             comm->write_callback(comm);
+            nevents++;
         } else
             // We process read events only if there was no write event because the write event could
             // cause a change that would result in the data structure going away.
-            if (evs[i].fflags & EVFILT_READ) {
+            if (evs[i].flags & EVFILT_READ) {
                 comm->read_callback(comm);
+                nevents++;
             }
     }
 #endif
+    return nevents;
 }
 
 void
@@ -392,7 +396,7 @@ setup_listener_socket(int family, int protocol, const char *name)
     }
     addr.sa.sa_family = family;
     addr.sa.sa_len = sl;
-    if (bind(listener->sock, &addr.sa, sl)) {
+    if (bind(listener->sock, &addr.sa, sl) < 0) {
         fprintf(stderr, "Can't bind to 0#53/%s%s: %s\n",
                 protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6",
                 strerror(errno));
@@ -411,8 +415,13 @@ setup_listener_socket(int family, int protocol, const char *name)
         }                
         add_reader(listener, listen_callback);
     } else {
-        rv = setsockopt(listener->sock, IPPROTO_IP,
+        rv = setsockopt(listener->sock, family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
                         family == AF_INET ? IP_PKTINFO : IPV6_RECVPKTINFO, &flag, sizeof flag);
+        if (rv < 0) {
+            fprintf(stderr, "Can't set %s: %s.\n", family == AF_INET ? "IP_PKTINFO" : "IPV6_RECVPKTINFO",
+                    strerror(errno));
+            goto out;
+        }
         add_reader(listener, udp_read_callback);
     }
 
@@ -434,6 +443,7 @@ main(int argc, char **argv)
     char *s, *p;
     int width;
     comm_t *listener;
+    struct timespec to;
 
     // Read the configuration from the command line.
     for (i = 1; i < argc; i++) {
@@ -574,9 +584,14 @@ main(int argc, char **argv)
     }
     listener->next = comms;
     comms = listener;
-
     
-
+    do {
+        int something = 0;
+        to.tv_sec = 1;
+        to.tv_nsec = 0;
+        something = dispatch_events(&to);
+        fprintf(stderr, "dispatched %d events.\n", something);
+    } while (1);
 }
 
 
