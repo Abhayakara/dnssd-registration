@@ -375,7 +375,7 @@ setup_listener_socket(int family, int protocol, const char *name)
         comm_free(listener);
         return NULL;
     }
-    rv = setsockopt(listener->sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof flag);
+    rv = setsockopt(listener->sock, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof flag);
     if (rv < 0) {
         fprintf(stderr, "SO_REUSEPORT failed: %s\n", strerror(errno));
         comm_free(listener);
@@ -392,9 +392,10 @@ setup_listener_socket(int family, int protocol, const char *name)
     }
     addr.sa.sa_family = family;
     addr.sa.sa_len = sl;
-    if (bind(listener->sock, &addr.sa, sizeof addr.sin)) {
-        fprintf(stderr, "Can't bind to 0#53/%s%s.\n",
-                protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6");
+    if (bind(listener->sock, &addr.sa, sl)) {
+        fprintf(stderr, "Can't bind to 0#53/%s%s: %s\n",
+                protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6",
+                strerror(errno));
     out:
         close(listener->sock);
         free(listener);
@@ -403,8 +404,9 @@ setup_listener_socket(int family, int protocol, const char *name)
 
     if (protocol == IPPROTO_TCP) {
         if (listen(listener->sock, 5 /* xxx */) < 0) {
-            fprintf(stderr, "Can't listen on 0#53/%s%s.\n",
-                    protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6");
+            fprintf(stderr, "Can't listen on 0#53/%s%s: %s.\n",
+                    protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6",
+                    strerror(errno));
             goto out;
         }                
         add_reader(listener, listen_callback);
