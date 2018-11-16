@@ -1,5 +1,19 @@
 /* srp-gw.c
  *
+ * Copyright (c) 2018 Apple Computer, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
  * This is a DNSSD Service Registration Protocol gateway.   The purpose of this is to make it possible
  * for SRP clients to update DNS servers that don't support SRP.
  *
@@ -39,6 +53,12 @@
 #include <arpa/inet.h>
 #include <sys/event.h>
 
+#define USE_KQUEUE // XXX
+
+#define ERROR(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define INFO(fmt, ...)  fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define DEBUG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+
 #pragma mark structures
 
 typedef union addr addr_t;
@@ -67,7 +87,6 @@ struct udp_validator {
 typedef struct message message_t;
 struct message {
     addr_t src;
-    size_t len;
     int ifindex;
     size_t length;
     dns_wire_t wire;
@@ -84,7 +103,7 @@ struct comm {
     read_callback_t read_callback;
     write_callback_t write_callback;
     datagram_callback_t datagram_callback;
-    datagram_callback_t close_callback;
+    close_callback_t close_callback;
     message_t *message;
     uint8_t *buf;
     addr_t address;
@@ -92,6 +111,8 @@ struct comm {
     size_t message_length, message_cur;
     int sock;
     uint8_t message_length_bytes[2];
+    bool want_read : 1;
+    bool want_write : 1;
 };
     
 
@@ -102,16 +123,16 @@ int kq;
 static int
 usage(const char *progname)
 {
-    fprintf(stderr, "usage: %s -s <addr> <port> -t <subnet> ... -u <ifname> <subnet> ...\n", progname);
-    fprintf(stderr, "  -s can only appear once.\n");
-    fprintf(stderr, "  -t can only appear once, and is followed by one or more subnets.\n");
-    fprintf(stderr, "  -u can appear more than once, is followed by one interface name, and\n");
-    fprintf(stderr, "     one or more subnets.\n");
-    fprintf(stderr, "  <addr> is an IPv4 address or IPv6 address.\n");
-    fprintf(stderr, "  <port> is a UDP port number.\n");
-    fprintf(stderr, "  <subnet> is an IP address followed by a slash followed by the prefix width.\n");
-    fprintf(stderr, "  <ifname> is the printable name of the interface.\n");
-    fprintf(stderr, "ex: srp-gw -s 2001:DB8::1 53 -t 2001:DB8:1300::/48 -u en0 2001:DB8:1300:1100::/56\n");
+    ERROR("usage: %s -s <addr> <port> -t <subnet> ... -u <ifname> <subnet> ...", progname);
+    ERROR("  -s can only appear once.");
+    ERROR("  -t can only appear once, and is followed by one or more subnets.");
+    ERROR("  -u can appear more than once, is followed by one interface name, and");
+    ERROR("     one or more subnets.");
+    ERROR("  <addr> is an IPv4 address or IPv6 address.");
+    ERROR("  <port> is a UDP port number.");
+    ERROR("  <subnet> is an IP address followed by a slash followed by the prefix width.");
+    ERROR("  <ifname> is the printable name of the interface.");
+    ERROR("ex: srp-gw -s 2001:DB8::1 53 -t 2001:DB8:1300::/48 -u en0 2001:DB8:1300:1100::/56");
     return 1;
 }
 
@@ -145,6 +166,8 @@ comm_free(comm_t *comm)
     free(comm);
 }
 
+
+
 int
 getipaddr(addr_t *addr, const char *p)
 {
@@ -160,54 +183,126 @@ getipaddr(addr_t *addr, const char *p)
 }                
 
 void
+dns_input(comm_t *comm)
+{
+    dns_message_t *message;
+#ifdef PARSER_BRINGUP_DONE
+    // Drop incoming responses--we're a server, so we only accept queries.
+    if (dns_qr_get(comm->message->bitfield) == dns_qr_response) {
+        message_free(comm->message);
+        comm->message = NULL;
+        return;
+    }
+
+    // Forward incoming messages that are queries but not updates.
+    if (dns_opcode_get(comm->message->bitfield) != dns_opcode_update) {
+        dns_forward(comm);
+        return;
+    }
+#endif
+    
+    // Parse updates.
+    if (!dns_wire_parse(&message, &comm->message->wire, comm->message->length)) {
+        ERROR("dns_wire_parse failed.");
+        return;
+    }
+    
+}
+
+void
 add_reader(comm_t *comm, read_callback_t callback)
 {
+#ifdef USE_SELECT
+    comm->want_read = true;
+#endif
 #ifdef USE_EPOLL
-#else // use kqueue
+#endif
+#ifdef USE_KQUEUE
     struct kevent ev;
-    struct kevent out;
     int rv;
-    EV_SET(&ev, comm->sock, EVFILT_READ, EV_ADD, 0, 0, comm);
+    EV_SET(&ev, comm->sock, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, comm);
     rv = kevent(kq, &ev, 1, NULL, 0, NULL);
     if (rv < 0) {
-        fprintf(stderr, "kevent add: %s\n", strerror(errno));
+        ERROR("kevent add: %s", strerror(errno));
         return;
     }
 #endif // USE_EPOLL
-
     comm->read_callback = callback;
 }
 
 int dispatch_events(struct timespec *timeout)
 {
-#ifdef USE_EPOLL
-#else // use kqueue
+#ifdef USE_SELECT
+    comm_t *comm, **cp;
+    int rv, nfds = 0;
+    fd_set reads, writes, errors;
+    struct timeval tv;
+
+    FD_ZERO(&reads);
+    FD_ZERO(&writes);
+    FD_ZERO(&errors);
+    tv.tv_sec = timeout->tv_sec;
+    tv.tv_usec = timeout->tv_nsec / 1000;
+    
+    cp = &comms;
+    while (*cp) {
+        comm = *cp;
+        if (comm->sock == -1) {
+            *cp = comm->next;
+            free(comm);
+            continue;
+        }
+        if (comm->want_read || comm->want_write) {
+            if (comm->sock >= nfds) {
+                nfds = comm->sock + 1;
+            }
+            if (comm->want_read) {
+                FD_SET(comm->sock, &reads);
+            }
+            if (comm->want_write) {
+                FD_SET(comm->sock, &writes);
+            }
+        }
+        cp = &comm->next;
+    }
+    rv = select(nfds, &reads, &writes, &writes, &tv);
+    if (rv < 0) {
+        ERROR("select: %s", strerror(errno));
+        exit(1);
+    }
+    for (comm = comms; comm; comm = comm->next) {
+        if (FD_ISSET(comm->sock, &reads)) {
+            comm->read_callback(comm);
+        } else {
+            if (FD_ISSET(comm->sock, &writes)) {
+                comm->write_callback(comm);
+            }
+        }
+    }
+    return rv;
+#endif
+#ifdef USE_KQUEUE
 #define KEV_MAX 1
-    int nevents = 0;
     struct kevent evs[KEV_MAX];
     comm_t *comm;
     int nev, i;
+
     nev = kevent(kq, NULL, 0, evs, KEV_MAX, timeout);
     if (nev < 0) {
-        fprintf(stderr, "kevent poll: %s\n", strerror(errno));
+        ERROR("kevent poll: %s", strerror(errno));
         exit(1);
     }
     for (i = 0; i < nev; i++) {
         comm = evs[i].udata;
 
-        if (evs[i].flags & EVFILT_WRITE) {
+        if (evs[i].filter == EVFILT_WRITE) {
             comm->write_callback(comm);
-            nevents++;
-        } else
-            // We process read events only if there was no write event because the write event could
-            // cause a change that would result in the data structure going away.
-            if (evs[i].flags & EVFILT_READ) {
-                comm->read_callback(comm);
-                nevents++;
-            }
+        } else if (evs[i].filter == EVFILT_READ) {
+            comm->read_callback(comm);
+        }
     }
+    return nev;
 #endif
-    return nevents;
 }
 
 void
@@ -233,12 +328,12 @@ udp_read_callback(comm_t *connection)
     
     rv = recvmsg(connection->sock, &msg, 0);
     if (rv < 0) {
-        fprintf(stderr, "udp_read_callback: %s\n", strerror(errno));
+        ERROR("udp_read_callback: %s", strerror(errno));
         return;
     }
     message = message_allocate(rv);
     if (!message) {
-        fprintf(stderr, "udp_read_callback: out of memory\n");
+        ERROR("udp_read_callback: out of memory");
         return;
     }
     memcpy(&message->src, &src, sizeof src);
@@ -260,7 +355,7 @@ udp_read_callback(comm_t *connection)
             message->ifindex = pktinfo.ipi_ifindex;
         }
     }
-
+    connection->message = message;
     connection->datagram_callback(connection);
 }
 
@@ -273,7 +368,7 @@ tcp_read_callback(comm_t *connection)
                   2 - connection->message_length_len);
         if (rv < 0) {
         read_error:
-            fprintf(stderr, "tcp_read_callback: %s\n", strerror(errno));
+            ERROR("tcp_read_callback: %s", strerror(errno));
             close(connection->sock);
             connection->sock = -1;
             if (connection->close_callback) {
@@ -286,7 +381,7 @@ tcp_read_callback(comm_t *connection)
         // the previous message.
         if (rv == 0) {
         eof:
-            fprintf(stderr, "tcp_read_callback: remote end (%s) closed connection\n", connection->name);
+            ERROR("tcp_read_callback: remote end (%s) closed connection", connection->name);
             close(connection->sock);
             connection->sock = -1;
             if (connection->close_callback) {
@@ -304,9 +399,9 @@ tcp_read_callback(comm_t *connection)
 
     // If we only just got the length, we need to allocate a message
     if (connection->message == NULL) {
-        connection->message = message_allocate(rv);
+        connection->message = message_allocate(connection->message_length);
         if (!connection->message) {
-            fprintf(stderr, "udp_read_callback: out of memory\n");
+            ERROR("udp_read_callback: out of memory");
             return;
         }
         connection->buf = (uint8_t *)&connection->message->wire;
@@ -341,7 +436,7 @@ listen_callback(comm_t *listener)
 
     rv = accept(listener->sock, &addr.sa, &addr_len);
     if (rv < 0) {
-        fprintf(stderr, "accept: %s\n", strerror(errno));
+        ERROR("accept: %s", strerror(errno));
         close(listener->sock);
         listener->sock = -1;
         return;
@@ -352,6 +447,7 @@ listen_callback(comm_t *listener)
     comm->next = comms;
     comms = comm;
     add_reader(comm, tcp_read_callback);
+    comm->datagram_callback = listener->datagram_callback;
 }
 
 
@@ -375,13 +471,13 @@ setup_listener_socket(int family, int protocol, const char *name)
     }
     listener->sock = socket(family, protocol == IPPROTO_UDP ? SOCK_DGRAM : SOCK_STREAM, protocol);
     if (listener->sock < 0) {
-        fprintf(stderr, "Can't get socket: %s\n", strerror(errno));
+        ERROR("Can't get socket: %s", strerror(errno));
         comm_free(listener);
         return NULL;
     }
     rv = setsockopt(listener->sock, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof flag);
     if (rv < 0) {
-        fprintf(stderr, "SO_REUSEPORT failed: %s\n", strerror(errno));
+        ERROR("SO_REUSEPORT failed: %s", strerror(errno));
         comm_free(listener);
         return NULL;
     }
@@ -397,7 +493,7 @@ setup_listener_socket(int family, int protocol, const char *name)
     addr.sa.sa_family = family;
     addr.sa.sa_len = sl;
     if (bind(listener->sock, &addr.sa, sl) < 0) {
-        fprintf(stderr, "Can't bind to 0#53/%s%s: %s\n",
+        ERROR("Can't bind to 0#53/%s%s: %s",
                 protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6",
                 strerror(errno));
     out:
@@ -408,7 +504,7 @@ setup_listener_socket(int family, int protocol, const char *name)
 
     if (protocol == IPPROTO_TCP) {
         if (listen(listener->sock, 5 /* xxx */) < 0) {
-            fprintf(stderr, "Can't listen on 0#53/%s%s: %s.\n",
+            ERROR("Can't listen on 0#53/%s%s: %s.",
                     protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6",
                     strerror(errno));
             goto out;
@@ -418,12 +514,13 @@ setup_listener_socket(int family, int protocol, const char *name)
         rv = setsockopt(listener->sock, family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
                         family == AF_INET ? IP_PKTINFO : IPV6_RECVPKTINFO, &flag, sizeof flag);
         if (rv < 0) {
-            fprintf(stderr, "Can't set %s: %s.\n", family == AF_INET ? "IP_PKTINFO" : "IPV6_RECVPKTINFO",
+            ERROR("Can't set %s: %s.", family == AF_INET ? "IP_PKTINFO" : "IPV6_RECVPKTINFO",
                     strerror(errno));
             goto out;
         }
         add_reader(listener, udp_read_callback);
     }
+    listener->datagram_callback = dns_input;
 
     return listener;
 }
@@ -449,22 +546,22 @@ main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-s")) {
             if (i++ == argc) {
-                fprintf(stderr, "-s is missing server IP address.\n");
+                ERROR("-s is missing server IP address.");
                 return usage(argv[0]);
             }
             len = getipaddr(&server, argv[i]);
             if (!len) {
-                fprintf(stderr, "Invalid IP address: %s.\n", argv[i]);
+                ERROR("Invalid IP address: %s.", argv[i]);
                 return usage(argv[0]);
             }
             server.sa.sa_len = len;
             if (i++ == argc) {
-                fprintf(stderr, "-s is missing server port.\n");
+                ERROR("-s is missing server port.");
                 return usage(argv[0]);
             }
             port = strtol(argv[i], &s, 10);
             if (s == argv[i] || s[0] != '\0') {
-                fprintf(stderr, "Invalid port number: %s\n", argv[i]);
+                ERROR("Invalid port number: %s", argv[i]);
                 return usage(argv[0]);
             }
             if (server.sa.sa_family == AF_INET) {
@@ -476,17 +573,17 @@ main(int argc, char **argv)
         } else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "-u")) {
             if (!strcmp(argv[i], "-u")) {
                 if (i++ == argc) {
-                    fprintf(stderr, "-u is missing interface name.\n");
+                    ERROR("-u is missing interface name.");
                     return usage(argv[0]);
                 }
                 *up = calloc(1, sizeof **up);
                 if (*up == NULL) {
-                    fprintf(stderr, "udp_validators: out of memory.\n");
+                    ERROR("udp_validators: out of memory.");
                  	return usage(argv[0]);
                 }
                 (*up)->ifname = strdup(argv[i]);
                 if ((*up)->ifname == NULL) {
-                    fprintf(stderr, "udp validators: ifname: out of memory.\n");
+                    ERROR("udp validators: ifname: out of memory.");
                     return usage(argv[0]);
                 }
                 sp = &((*up)->subnets);
@@ -495,37 +592,37 @@ main(int argc, char **argv)
             }
 
             if (i++ == argc) {
-                fprintf(stderr, "%s requires at least one prefix.\n", argv[i - 1]);
+                ERROR("%s requires at least one prefix.", argv[i - 1]);
                 return usage(argv[0]);
             }
             s = strchr(argv[i], '/');
             if (p == NULL) {
-                fprintf(stderr, "%s is not a prefix.\n", argv[i]);
+                ERROR("%s is not a prefix.", argv[i]);
                 return usage(argv[0]);
             }
             *p = 0;
             ++p;
             prefalen = getipaddr(&pref, argv[i]);
             if (!prefalen) {
-                fprintf(stderr, "%s is not a valid prefix address.\n", argv[i]);
+                ERROR("%s is not a valid prefix address.", argv[i]);
                 return usage(argv[0]);
             }
             width = strtol(p, &s, 10);
             if (s == p || s[0] != '\0') {
-                fprintf(stderr, "%s (prefix width) is not a number.\n", p);
+                ERROR("%s (prefix width) is not a number.", p);
                 return usage(argv[0]);
             }
             if (width < 0 ||
                 (pref.sa.sa_family == AF_INET && width > 32) ||
                 (pref.sa.sa_family == AF_INET6 && width > 64)) {
-                fprintf(stderr, "%s is not a valid prefix length for %s\n", p,
+                ERROR("%s is not a valid prefix length for %s", p,
                         pref.sa.sa_family == AF_INET ? "IPv4" : "IPv6");
                 return usage(argv[0]);
             }
 
             *nt = calloc(1, sizeof **nt);
             if (!*nt) {
-                fprintf(stderr, "tcp_validators: out of memory.\n");
+                ERROR("tcp_validators: out of memory.");
                 return 1;
             }
 
@@ -548,14 +645,14 @@ main(int argc, char **argv)
 
     kq = kqueue();
     if (kq < 0) {
-        fprintf(stderr, "kqueue(): %s\n", strerror(errno));
+        ERROR("kqueue(): %s", strerror(errno));
         return 1;
     }
 
     // Set up listeners
     listener = setup_listener_socket(AF_INET, IPPROTO_UDP, "UDPv4 listener");
     if (!listener) {
-        fprintf(stderr, "UDPv4 listener: fail.\n");
+        ERROR("UDPv4 listener: fail.");
         return 1;
     }
     listener->next = comms;
@@ -563,7 +660,7 @@ main(int argc, char **argv)
     
     listener = setup_listener_socket(AF_INET6, IPPROTO_UDP, "UDPv6 listener");
     if (!listener) {
-        fprintf(stderr, "UDPv6 listener: fail.\n");
+        ERROR("UDPv6 listener: fail.");
         return 1;
     }
     listener->next = comms;
@@ -571,7 +668,7 @@ main(int argc, char **argv)
 
     listener = setup_listener_socket(AF_INET, IPPROTO_TCP, "TCPv4 listener");
     if (!listener) {
-        fprintf(stderr, "TCPv4 listener: fail.\n");
+        ERROR("TCPv4 listener: fail.");
         return 1;
     }
     listener->next = comms;
@@ -579,7 +676,7 @@ main(int argc, char **argv)
 
     listener = setup_listener_socket(AF_INET6, IPPROTO_TCP, "TCPv6 listener");
     if (!listener) {
-        fprintf(stderr, "TCPv4 listener: fail.\n");
+        ERROR("TCPv4 listener: fail.");
         return 1;
     }
     listener->next = comms;
@@ -590,10 +687,9 @@ main(int argc, char **argv)
         to.tv_sec = 1;
         to.tv_nsec = 0;
         something = dispatch_events(&to);
-        fprintf(stderr, "dispatched %d events.\n", something);
+        INFO("dispatched %d events.", something);
     } while (1);
 }
-
 
 // Local Variables:
 // mode: C

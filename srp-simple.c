@@ -1,5 +1,19 @@
 /* srp-simple.c
  *
+ * Copyright (c) 2018 Apple Computer, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
  * Simple Service Registration Protocol Client
  *
  * This is intended for the constrained node solution for SRP.   It's intended to be flexible and
@@ -26,7 +40,7 @@ main(int argc, char **argv)
     const char *a_record = "127.0.0.1";
     const char *aaaa_record = "::1";
     const char *txt_record = "0";
-    const char *anycast_address = "10.0.10.1";
+    const char *anycast_address = "127.0.0.1";
     int port;
     int private_key_len = 0;
     int public_key_len = 0;
@@ -203,12 +217,12 @@ main(int argc, char **argv)
     
     // What about services with more than one name?   Are these multiple service descriptions?
 
-    // ADCOUNT = 2
+    // ARCOUNT = 2
     //   EDNS(0) options
     //     ...
     //   SIG(0)
     
-    message.adcount = htons(1);
+    message.arcount = htons(1);
     dns_edns0_header_to_wire(&txn, DNS_MAX_UDP_PAYLOAD, 0, 0, 1); CH;	// XRCODE = 0; VERSION = 0; DO=1
     dns_rdlength_begin(&txn); CH;
     dns_ui16_to_wire(&txn, dns_opt_update_lease); CH;  // OPTION-CODE

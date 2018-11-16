@@ -2,6 +2,7 @@ CFLAGS = -O0 -g
 
 all:	srp-simple srp-gw
 
-srp-simple:	wire.o srp-simple.o
+srp-simple:	towire.o srp-simple.o
 
-srp-gw:	srp-gw.o wire.o
+srp-gw:	srp-gw.o towire.o fromwire.o
+

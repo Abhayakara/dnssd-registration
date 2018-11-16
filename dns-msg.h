@@ -1,10 +1,25 @@
 /* dns-msg.h
  *
+ * Copyright (c) 2018 Apple Computer, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
  * Lightweight framework for generating, sending, and unpacking DNS messages.
  * Definitions...
  */
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __clang__
 #define NULLABLE _Nullable
@@ -27,7 +42,7 @@ struct dns_wire {
     uint16_t qdcount;
     uint16_t ancount;
     uint16_t nscount;
-    uint16_t adcount;
+    uint16_t arcount;
     uint8_t data[DNS_DATA_SIZE];
 };
 
@@ -54,6 +69,40 @@ struct dns_name_pointer {
 };
 
 typedef void (*dns_response_callback_t)(dns_transaction_t *NONNULL txn);
+
+typedef struct dns_label dns_label_t;
+struct dns_label {
+    dns_label_t *NULLABLE next;
+    uint8_t len;
+    char data[DNS_MAX_LABEL_SIZE];
+};
+
+typedef struct dns_rrset dns_rrset_t;
+struct dns_rrset {
+    dns_label_t *NONNULL name;
+    uint16_t type;
+    uint16_t qclass;
+    uint16_t rdlen;
+    uint32_t ttl;
+    uint8_t *NULLABLE data;
+};
+
+typedef struct dns_edns0 dns_edns0_t;
+struct dns_edns0 {
+    dns_edns0_t *NULLABLE next;
+    uint16_t length;
+    uint8_t data[0];
+};
+
+typedef struct dns_message dns_message_t;
+struct dns_message {
+    int qdcount, ancount, nscount, arcount;
+    dns_rrset_t *NULLABLE questions;
+    dns_rrset_t *NULLABLE answers;
+    dns_rrset_t *NULLABLE authority;
+    dns_rrset_t *NULLABLE additional;
+    dns_edns0_t *NULLABLE edns0;
+};
 
 // Masks for bitfield data
 #define dns_qr_mask     0x8000
@@ -222,6 +271,8 @@ typedef void (*dns_response_callback_t)(dns_transaction_t *NONNULL txn);
 #define dns_opt_chain         13 // [RFC7901]
 #define dns_opt_key_tag       14 // [RFC8145]
 
+// towire.c:
+
 uint16_t srp_random16(void);
 void dns_name_to_wire(dns_name_pointer_t *NULLABLE r_pointer,
                       dns_transaction_t *NONNULL txn,
@@ -274,6 +325,15 @@ int dns_send_to_server(dns_transaction_t *NONNULL txn,
                        const char *NONNULL anycast_address,
                        dns_response_callback_t NONNULL callback);
 
+// fromwire.c:
+dns_label_t * NULLABLE dns_label_parse(dns_wire_t *NONNULL message, unsigned mlen, unsigned *NONNULL offp);
+bool dns_opt_parse(dns_edns0_t *NONNULL *NULLABLE ret, dns_rrset_t *NONNULL rrset);
+bool dns_name_parse(dns_wire_t *NONNULL message,
+                    unsigned len, unsigned *NONNULL offp, unsigned base,
+                    dns_label_t *NONNULL *NULLABLE prev);
+bool dns_rr_parse(dns_rrset_t *NONNULL rrset,
+                  dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp, bool rrdata_permitted);
+bool dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message, unsigned len);
 
 // Local Variables:
 // mode: C
