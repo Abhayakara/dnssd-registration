@@ -222,7 +222,7 @@ main(int argc, char **argv)
     //     ...
     //   SIG(0)
     
-    message.arcount = htons(1);
+    message.arcount = htons(2);
     dns_edns0_header_to_wire(&txn, DNS_MAX_UDP_PAYLOAD, 0, 0, 1); CH;	// XRCODE = 0; VERSION = 0; DO=1
     dns_rdlength_begin(&txn); CH;
     dns_ui16_to_wire(&txn, dns_opt_update_lease); CH;  // OPTION-CODE
