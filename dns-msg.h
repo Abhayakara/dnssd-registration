@@ -77,14 +77,43 @@ struct dns_label {
     char data[DNS_MAX_LABEL_SIZE];
 };
 
+typedef struct dns_txt_element dns_txt_element_t;
+struct dns_txt_element {
+    dns_txt_element_t *NULLABLE next;
+    uint8_t len;
+    char data[0];
+};
+
 typedef struct dns_rrset dns_rrset_t;
 struct dns_rrset {
     dns_label_t *NONNULL name;
     uint16_t type;
     uint16_t qclass;
-    uint16_t rdlen;
     uint32_t ttl;
-    uint8_t *NULLABLE data;
+    union {
+        struct {
+            uint8_t *NULLABLE data;
+            uint16_t len;
+        } unparsed;
+        struct {
+            dns_label_t *NONNULL name;
+        } ptr, cname;
+        struct {
+            struct in_addr *NONNULL addrs;
+            int num;
+        } a;
+        struct {
+            struct in6_addr *NONNULL addrs;
+            int num;
+        } aaaa;
+        struct {
+            dns_label_t *NONNULL name;
+            uint16_t priority;
+            uint16_t weight;
+            uint16_t port;
+        } srv;
+        dns_txt_element_t *NONNULL txt;
+    } data;
 };
 
 typedef struct dns_edns0 dns_edns0_t;
@@ -328,9 +357,8 @@ int dns_send_to_server(dns_transaction_t *NONNULL txn,
 // fromwire.c:
 dns_label_t * NULLABLE dns_label_parse(dns_wire_t *NONNULL message, unsigned mlen, unsigned *NONNULL offp);
 bool dns_opt_parse(dns_edns0_t *NONNULL *NULLABLE ret, dns_rrset_t *NONNULL rrset);
-bool dns_name_parse(dns_wire_t *NONNULL message,
-                    unsigned len, unsigned *NONNULL offp, unsigned base,
-                    dns_label_t *NONNULL *NULLABLE prev);
+bool dns_name_parse(dns_label_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message, unsigned len,
+                    unsigned *NONNULL offp, unsigned base);
 bool dns_rr_parse(dns_rrset_t *NONNULL rrset,
                   dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp, bool rrdata_permitted);
 bool dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message, unsigned len);

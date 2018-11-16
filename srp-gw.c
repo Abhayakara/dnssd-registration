@@ -534,7 +534,7 @@ main(int argc, char **argv)
     udp_validator_t *NULLABLE *NONNULL up = &udp_validators;
     subnet_t *NULLABLE *NONNULL nt = &tcp_validators;
     subnet_t *NULLABLE *NONNULL sp;
-    addr_t server, pref, ipv4src, ipv6src;
+    addr_t server, pref;
     uint16_t port;
     socklen_t len, prefalen;
     char *s, *p;
@@ -596,19 +596,19 @@ main(int argc, char **argv)
                 return usage(argv[0]);
             }
             s = strchr(argv[i], '/');
-            if (p == NULL) {
+            if (s == NULL) {
                 ERROR("%s is not a prefix.", argv[i]);
                 return usage(argv[0]);
             }
-            *p = 0;
-            ++p;
+            *s = 0;
+            ++s;
             prefalen = getipaddr(&pref, argv[i]);
             if (!prefalen) {
                 ERROR("%s is not a valid prefix address.", argv[i]);
                 return usage(argv[0]);
             }
-            width = strtol(p, &s, 10);
-            if (s == p || s[0] != '\0') {
+            width = strtol(s, &p, 10);
+            if (s == p || p[0] != '\0') {
                 ERROR("%s (prefix width) is not a number.", p);
                 return usage(argv[0]);
             }

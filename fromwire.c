@@ -32,6 +32,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "dns-msg.h"
 
 #define DEBUG(...) fprintf(stderr, ##__VA_ARGS__)
@@ -69,8 +70,8 @@ dns_label_parse(dns_wire_t *NONNULL message, unsigned mlen, unsigned *NONNULL of
 }
 
 bool
-dns_name_parse(dns_wire_t *NONNULL message, unsigned len,
-               unsigned *NONNULL offp, unsigned base, dns_label_t *NONNULL *NULLABLE prev)
+dns_name_parse(dns_label_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message, unsigned len,
+               unsigned *NONNULL offp, unsigned base)
 {
     dns_label_t *rv;
 
@@ -110,7 +111,7 @@ dns_name_parse(dns_wire_t *NONNULL message, unsigned len,
                   pointer, message->data[pointer]);
             return false;
         }
-        return dns_name_parse(message, len, &pointer, pointer, prev);
+        return dns_name_parse(ret, message, len, &pointer, pointer);
     }
     // We don't support binary labels, which are historical, and at this time there are no other valid
     // DNS label types.
@@ -124,12 +125,12 @@ dns_name_parse(dns_wire_t *NONNULL message, unsigned len,
         return false;
     }
 
-    *prev = rv;
+    *ret = rv;
 
     if (rv->len == 0) {
         return true;
     }
-    return dns_name_parse(message, len, offp, base, &rv->next);
+    return dns_name_parse(&rv->next, message, len, offp, base);
 }
 
 bool
@@ -163,15 +164,197 @@ dns_u32_parse(dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp,
     return true;
 }
 
+static void
+dns_name_dump(FILE *outfile, dns_label_t *name)
+{
+    char *prev = "";
+    dns_label_t *lp;
+    
+    for (lp = name; lp; lp = lp->next) {
+        fprintf(outfile, "%s%s", prev, lp->data);
+        prev = ".";
+    }
+}
+
+static void
+dns_rrdata_dump(FILE *outfile, dns_rrset_t *rrset)
+{
+    int i;
+    char nbuf[80];
+    dns_txt_element_t *txt;
+
+    switch(rrset->type) {
+    case dns_rrtype_srv:
+        fprintf(outfile, "SRV %d %d %d ", rrset->data.srv.priority, rrset->data.srv.weight, rrset->data.srv.port);
+        dns_name_dump(outfile, rrset->data.ptr.name);
+        break;
+
+    case dns_rrtype_ptr:
+        fputs("PTR ", outfile);
+        dns_name_dump(outfile, rrset->data.ptr.name);
+        break;
+
+    case dns_rrtype_cname:
+        fputs("CNAME ", outfile);
+        dns_name_dump(outfile, rrset->data.ptr.name);
+        break;
+
+    case dns_rrtype_a:
+        for (i = 0; i < rrset->data.a.num; i++) {
+            inet_ntop(AF_INET, &rrset->data.a.addrs[i], nbuf, sizeof nbuf);
+            fputs(nbuf, outfile);
+            putc(' ', outfile);
+        }
+        break;
+        
+    case dns_rrtype_aaaa:
+        for (i = 0; i < rrset->data.aaaa.num; i++) {
+            inet_ntop(AF_INET6, &rrset->data.aaaa.addrs[i], nbuf, sizeof nbuf);
+            fputs(nbuf, outfile);
+            putc(' ', outfile);
+        }
+        break;
+
+    case dns_rrtype_txt:
+        for (txt = rrset->data.txt; txt; txt = txt->next) {
+            if (txt == rrset->data.txt) {
+                putc(' ', outfile);
+            }
+            putc('"', outfile);
+            for (i = 0; i < txt->len; i++) {
+                if (isascii(txt->data[i]) && isprint(txt->data[i])) {
+                    putc(txt->data[i], outfile);
+                } else {
+                    fprintf(outfile, "<%x>", txt->data[i]);
+                }
+            }
+            putc('"', outfile);
+        }
+        break;
+
+    default:
+        if (rrset->data.unparsed.len == 0) {
+            fprintf(outfile, " <none>");
+        } else {
+            fprintf(outfile, "%02x", rrset->data.unparsed.data[0]);
+            for (i = 1; i < rrset->data.unparsed.len; i++) {
+                printf(" %02x", rrset->data.unparsed.data[i]);
+            }
+        }
+        break;
+    }
+}
+
+static bool
+dns_rdata_parse(dns_rrset_t *NONNULL rrset,
+                dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp)
+{
+    uint16_t rdlen;
+    unsigned target;
+    uint16_t addrlen;
+    dns_txt_element_t *txt, **ptxt;
+    
+    if (!dns_u16_parse(message, len, offp, &rdlen)) {
+        return false;
+    }
+    target = *offp + rdlen;
+    if (target > len) {
+        return false;
+    }
+
+    switch(rrset->type) {
+    case dns_rrtype_srv:
+        if (!dns_u16_parse(message, len, offp, &rrset->data.srv.priority)) {
+            return false;
+        }
+        if (!dns_u16_parse(message, len, offp, &rrset->data.srv.weight)) {
+            return false;
+        }
+        if (!dns_u16_parse(message, len, offp, &rrset->data.srv.port)) {
+            return false;
+        }
+        // This fallthrough assumes that the first element in the srv, ptr and cname structs is
+        // a pointer to a domain name.
+
+    case dns_rrtype_ptr:
+    case dns_rrtype_cname:
+        if (!dns_name_parse(&rrset->data.ptr.name, message, len, offp, *offp)) {
+            return false;
+        }
+        break;
+
+        // We assume below that the a and aaaa structures in the data union are exact aliases of
+        // each another.
+    case dns_rrtype_a:
+        addrlen = 4;
+        goto addr_parse;
+        
+    case dns_rrtype_aaaa:
+        addrlen = 16;
+    addr_parse:
+        if (rdlen & (addrlen - 1)) {
+            DEBUG("dns_rdata_parse: %s rdlen not an even multiple of %u: %u",
+                  addrlen == 4 ? "A" : "AAAA", addrlen, rdlen);
+            return false;
+        }
+        rrset->data.a.addrs = malloc(rdlen);
+        if (rrset->data.a.addrs == NULL) {
+            return false;
+        }
+        rrset->data.a.num = rdlen /  addrlen;
+        memcpy(rrset->data.a.addrs, &message->data[*offp], rdlen);
+        *offp = target;
+        break;
+        
+    case dns_rrtype_txt:
+        ptxt = &rrset->data.txt;
+        while (*offp < target) {
+            unsigned tlen = message->data[*offp];
+            if (*offp + tlen + 1 > target) {
+                DEBUG("dns_rdata_parse: TXT RR length is larger than available space: %u %u",
+                      *offp + tlen + 1, target);
+                *ptxt = NULL;
+                return false;
+            }
+            txt = malloc(tlen + 1 + sizeof *txt);
+            if (txt == NULL) {
+                DEBUG("dns_rdata_parse: no memory for TXT RR");
+                return false;
+            }
+            txt->len = tlen;
+            ++*offp;
+            memcpy(txt->data, &message->data[*offp], tlen);
+            *offp += tlen;
+            txt->data[tlen] = 0;
+            *ptxt = txt;
+            ptxt = &txt->next;
+        }
+        break;
+
+    default:
+        if (rdlen > 0) {
+            rrset->data.unparsed.data = malloc(rdlen);
+            if (rrset->data.unparsed.data == NULL) {
+                return false;
+            }
+            memcpy(rrset->data.unparsed.data, &message->data[*offp], rdlen);
+        }
+        rrset->data.unparsed.len = rdlen;
+        *offp = target;
+        break;
+    }
+    if (*offp != target) {
+        DEBUG("dns_rdata_parse: parse for rrtype %d not fully contained: %u %u", rrset->type, target, *offp);
+        return false;
+    }
+    return true;
+}
+
 bool
 dns_rr_parse(dns_rrset_t *NONNULL rrset,
              dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp, bool rrdata_expected)
 {
-    dns_label_t *lp;
-    char *prev = "";
-    int i;
-
-    if (!dns_name_parse(message, len, offp, *offp, &rrset->name)) {
+    if (!dns_name_parse(&rrset->name, message, len, offp, *offp)) {
         return false;
     }
     
@@ -187,34 +370,16 @@ dns_rr_parse(dns_rrset_t *NONNULL rrset,
         if (!dns_u32_parse(message, len, offp, &rrset->ttl)) {
             return false;
         }
-        if (!dns_u16_parse(message, len, offp, &rrset->rdlen)) {
+        if (!dns_rdata_parse(rrset, message, len, offp)) {
             return false;
         }
-        if (*offp + rrset->rdlen > len) {
-            return false;
-        }
-        rrset->data = malloc(rrset->rdlen + 1);
-        if (rrset->data == NULL) {
-            return false;
-        }
-        memcpy(rrset->data, &message->data[*offp], rrset->rdlen);
-        rrset->data[rrset->rdlen + 1] = 0; // For text-format RRs
-        *offp += rrset->rdlen;
     }
         
     printf("rrtype: %u  qclass: %u  name: ", rrset->type, rrset->qclass);
-    for (lp = rrset->name; lp; lp = lp->next) {
-        printf("%s%s", prev, lp->data);
-        prev = ".";
-    }
+    dns_name_dump(stdout, rrset->name);
     if (rrdata_expected) {
-        printf("  rrdata:");
-        for (i = 0; i < rrset->rdlen; i++) {
-            printf(" %02x", rrset->data[i]);
-        }
-        if (rrset->rdlen == 0) {
-            printf(" <none>");
-        }
+        printf("  rrdata: ");
+        dns_rrdata_dump(stdout, rrset);
     }
     printf("\n");
     return true;
@@ -231,6 +396,31 @@ void dns_name_free(dns_label_t *name)
     return dns_name_free(next);
 }    
 
+static void
+dns_rrdata_free(dns_rrset_t *rrset)
+{
+    switch(rrset->type) {
+    case dns_rrtype_srv:
+    case dns_rrtype_ptr:
+    case dns_rrtype_cname:
+        dns_name_free(rrset->data.ptr.name);
+        rrset->data.ptr.name = NULL;
+        break;
+
+    case dns_rrtype_a:
+    case dns_rrtype_aaaa:
+        free(rrset->data.a.addrs);
+        rrset->data.a.addrs = NULL;
+        break;
+        
+    case dns_rrtype_txt:
+    default:
+        free(rrset->data.unparsed.data);
+        rrset->data.unparsed.data = NULL;
+        break;
+    }
+}
+
 void
 dns_message_free(dns_message_t *message)
 {
@@ -243,12 +433,9 @@ dns_message_free(dns_message_t *message)
             dns_name_free(set->name);				\
             set->name = NULL;						\
         }											\
-        if (set->data) {							\
-            free(set->data);						\
-            set->data = NULL;						\
-        }											\
+        dns_rrdata_free(set);                       \
     }												\
-    if (message->questions) {						\
+    if (message->sets) {    						\
         free(message->sets);						\
     }
     FREE(qdcount, questions);
@@ -269,7 +456,7 @@ dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message
         return false;
     }
     
-#define PARSE(count, sets, name)                                                    \
+#define PARSE(count, sets, name, rrdata_expected)                                   \
     rv->count = htons(message->count);                                              \
     if (rv->count > 50) {                                                           \
         dns_message_free(rv);                                                       \
@@ -285,16 +472,16 @@ dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message
     }                                                                               \
                                                                                     \
     for (i = 0; i < rv->count; i++) {                                               \
-        if (!dns_rr_parse(&rv->sets[i], message, len, &offset, false)) {		    \
+        if (!dns_rr_parse(&rv->sets[i], message, len, &offset, rrdata_expected)) {  \
             dns_message_free(rv);                                                   \
             fprintf(stderr, name " %d RR parse failed.\n", i);                      \
             return false;                                                           \
         }                                                                           \
     }
-    PARSE(qdcount,  questions, "question");
-    PARSE(ancount,    answers, "answers");
-    PARSE(nscount,  authority, "authority");
-    PARSE(arcount, additional, "additional");
+    PARSE(qdcount,  questions, "question", false);
+    PARSE(ancount,    answers, "answers", true);
+    PARSE(nscount,  authority, "authority", true);
+    PARSE(arcount, additional, "additional", true);
 #undef PARSE
     
     for (i = 0; i < rv->ancount; i++) {

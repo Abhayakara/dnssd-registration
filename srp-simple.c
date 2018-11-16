@@ -41,7 +41,7 @@ main(int argc, char **argv)
     const char *aaaa_record = "::1";
     const char *txt_record = "0";
     const char *anycast_address = "127.0.0.1";
-    int port;
+    int port = 9992;
     int private_key_len = 0;
     int public_key_len = 0;
     uint8_t *private_key = NULL;
@@ -54,7 +54,7 @@ main(int argc, char **argv)
     dns_name_pointer_t p_service_instance_name;
     int line;
 
-#define CH if (txn.error) goto fail;
+#define CH if (txn.error) { line = __LINE__; goto fail; }
 
     // Generate a random UUID.
 #ifdef NOTYET
@@ -236,6 +236,7 @@ main(int argc, char **argv)
 
     // Send the update
     if (dns_send_to_server(&txn, anycast_address, dns_response_callback) < 0) {
+        line = __LINE__;
     fail:
         printf("dns_send_to_server failed: %s at line %d\n", strerror(txn.error), line);
     }
