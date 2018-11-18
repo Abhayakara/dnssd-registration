@@ -71,6 +71,7 @@ struct dns_name_pointer {
 typedef void (*dns_response_callback_t)(dns_transaction_t *NONNULL txn);
 
 typedef struct dns_label dns_label_t;
+typedef dns_label_t dns_name_t;
 struct dns_label {
     dns_label_t *NULLABLE next;
     uint8_t len;

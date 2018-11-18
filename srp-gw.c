@@ -182,31 +182,124 @@ getipaddr(addr_t *addr, const char *p)
     }
 }                
 
+typedef struct dns_host_record dns_host_record_t;
+struct dns_host_record {
+    dns_host_record_t *next;
+    dns_name_t *name;
+    dns_rrset_t *a, *aaaa, *key;
+};
+
 void
-dns_input(comm_t *comm)
+srp_relay(comm_t *comm, dns_message_t *message)
+{
+    dns_name_t *update_zone;
+    bool updating_services_dot_arpa = false;
+    int i, j;
+    dns_host_record_t *host_records = NULL, *hrp, **hrpp;
+
+    // Update requires a single SOA record as the question
+    if (message->qdcount != 1) {
+        ERROR("srp_relay: update received with qdcount > 1");
+        return;
+    }
+
+    // Update should contain zero answers.
+    if (message->ancount != 0) {
+        ERROR("srp_relay: update received with ancount > 0");
+        return;
+    }
+
+    if (message->questions[0].rrtype != dns_rrtype_soa) {
+        ERROR("srp_relay: update received with rrtype %d instead of SOA in question section.",
+              message->questions[0].rrtype);
+        return;
+    }
+    update_zone = message->questions[0].name;
+
+    // What zone are we updating?
+    if (dns_name_equals_text(update_zone, "services.arpa")) {
+        updating_services_dot_arpa = true;
+    }
+
+    // Find all the host records we're updating
+    num_host_records = 0;
+    hrpp = &host_records;
+    for (i = 0; i < message->nscount; i++) {
+        dns_rrtype_t *rr = &message->authority[i];
+        if (rr->type == dns_rrtype_a || rr->type == dns_rrtype_aaaa || rr->type == dns_rrtype_key) {
+            for (hrp = host_records; hrp; hrp = hrp->next) {
+                if (dns_names_equal(hrp->name, rr->name)) {
+                    break;
+                }
+            }
+            // If we didn't find a match, allocate a new host record.
+            if (hrp == NULL) {
+                hrp = calloc(sizeof *hrp, 1);
+                if (!hrp) {
+                    ERROR("srp_relay: no memory");
+                    goto out;
+                }
+                *hrpp = hrp;
+                hrpp = *hrp->next;
+            }
+            if (rr->type == dns_rrtype_a) {
+                if (hrp->a != NULL) {
+                    ERROR("srp_relay: more than one A rrset received for name: ",
+                          dns_name_print(hrp->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+                hrp->a = rr;
+            } else if (rr->type == dns_rrtype_aaaa) {
+                if (hrp->aaaa != NULL) {
+                    ERROR("srp_relay: more than one AAAA rrset received for name: ",
+                          dns_name_print(hrp->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+                hrp->aaaa = rr;
+            } else if (rr->type == dns_rrtype_key) {
+                if (hrp->key != NULL) {
+                    ERROR("srp_relay: more than one KEY rrset received for name: ",
+                          dns_name_print(hrp->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+                hrp->key =  rr;
+            }
+        }
+    }            
+}
+
+void
+dns_evaluate(comm_t *comm)
 {
     dns_message_t *message;
-#ifdef PARSER_BRINGUP_DONE
+
     // Drop incoming responses--we're a server, so we only accept queries.
     if (dns_qr_get(comm->message->bitfield) == dns_qr_response) {
-        message_free(comm->message);
-        comm->message = NULL;
         return;
     }
 
     // Forward incoming messages that are queries but not updates.
+    // XXX do this later--for now we operate only as a translator, not a proxy.
     if (dns_opcode_get(comm->message->bitfield) != dns_opcode_update) {
-        dns_forward(comm);
+        // dns_forward(comm);
         return;
     }
-#endif
     
-    // Parse updates.
+    // Parse the UPDATE message.
     if (!dns_wire_parse(&message, &comm->message->wire, comm->message->length)) {
         ERROR("dns_wire_parse failed.");
         return;
     }
     
+    srp_relay(comm, message);
+    dns_message_free(message);
+}
+
+void dns_input(comm_t *comm)
+{
+    dns_evaluate(comm);
+    message_free(comm->message);
+    comm->message = NULL;
 }
 
 void
