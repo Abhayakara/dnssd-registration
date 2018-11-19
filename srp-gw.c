@@ -226,21 +226,42 @@ srp_relay(comm_t *comm, dns_message_t *message)
     hrpp = &host_records;
     for (i = 0; i < message->nscount; i++) {
         dns_rrtype_t *rr = &message->authority[i];
-        if (rr->type == dns_rrtype_a || rr->type == dns_rrtype_aaaa || rr->type == dns_rrtype_key) {
+        // Every hostname update must be preceded by a delete for the name.
+        // For the delete to be the delete of a hostname, it must precede an A or an AAAA
+        // update; however, the KEY record is also valid here, and could be first, so we
+        // have to check for that as well.   If none of these conditions match, this could
+        // be a delete for a service instance name.
+        if (rr->type == dns_rrtype_any && rr->class == dns_qclass_any && rr->ttl == 0 &&
+            i + 1 < message->nscount &&
+            (rr[1].type == dns_rrtype_a || rr[1].type == dns_rrtype_aaaa ||
+             (i + 2 < message->nscount && rr[1].type == dns_rrtype_key &&
+              (rr[2].type == dns_rrtype_a || rr[2].type == dns_rrtype_aaaa)))) {
+            // There shouldn't already be an entry for this name.
+            for (hrp = host_records; hrp; hrp = hrp->next) {
+                if (dns_names_equal(hrp->name, rr->name)) {
+                    ERROR("srp_relay: delete for %s when the name has already been seen.",
+                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+            }
+            hrp = calloc(sizeof *hrp, 1);
+            if (!hrp) {
+                ERROR("srp_relay: no memory");
+                goto out;
+            }
+            *hrpp = hrp;
+            hrpp = *hrp->next;
+        } else if (rr->type == dns_rrtype_a || rr->type == dns_rrtype_aaaa || rr->type == dns_rrtype_key) {
             for (hrp = host_records; hrp; hrp = hrp->next) {
                 if (dns_names_equal(hrp->name, rr->name)) {
                     break;
                 }
             }
-            // If we didn't find a match, allocate a new host record.
+            // If we didn't find a match, it means that there was no delete for this record.
             if (hrp == NULL) {
-                hrp = calloc(sizeof *hrp, 1);
-                if (!hrp) {
-                    ERROR("srp_relay: no memory");
-                    goto out;
-                }
-                *hrpp = hrp;
-                hrpp = *hrp->next;
+                ERROR("srp_relay: name %s appears without a preceding delete.",
+                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+                goto out;
             }
             if (rr->type == dns_rrtype_a) {
                 if (hrp->a != NULL) {
@@ -265,7 +286,10 @@ srp_relay(comm_t *comm, dns_message_t *message)
                 hrp->key =  rr;
             }
         }
-    }            
+    }
+
+    // Find all service instances.
+    
 }
 
 void
