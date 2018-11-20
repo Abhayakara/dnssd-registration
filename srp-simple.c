@@ -36,7 +36,7 @@ int
 main(int argc, char **argv)
 {
     const char *host_name = "thread-demo";
-    const char *service_type = "_printer._tcp";
+    const char *service_type = "_ipps._tcp";
     const char *a_record = "127.0.0.1";
     const char *aaaa_record = "::1";
     const char *txt_record = "0";
@@ -80,7 +80,7 @@ main(int argc, char **argv)
     // Copy in Zone name (and save pointer)
     // ZTYPE = SOA
     // ZCLASS = IN
-    dns_full_name_to_wire(&p_zone_name, &txn, "service.arpa"); CH;
+    dns_full_name_to_wire(&p_zone_name, &txn, "default.service.arpa"); CH;
     dns_ui16_to_wire(&txn, dns_rrtype_soa); CH;
     dns_ui16_to_wire(&txn, dns_qclass_in); CH;
 
