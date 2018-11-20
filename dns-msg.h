@@ -154,14 +154,15 @@ struct dns_message {
 #define dns_flags_cd 0x0010
 
 // Getters
-#define dns_qr_get(w) (((w).bitfield & dns_qr_mask) >> dns_qr_shift)
-#define dns_opcode_get(w) (((w).bitfield & dns_opcode_mask) >> dns_opcode_shift)
-#define dns_rcode_get(w) (((w).bitfield & dns_rcode_mask) >> dns_rcode_shift)
+#define dns_qr_get(w) (((w)->bitfield & dns_qr_mask) >> dns_qr_shift)
+#define dns_opcode_get(w) (((w)->bitfield & dns_opcode_mask) >> dns_opcode_shift)
+#define dns_rcode_get(w) (((w)->bitfield & dns_rcode_mask) >> dns_rcode_shift)
 
 // Setters
-#define dns_qr_set(w, value) ((w).bitfield = (((w).bitfield & ~dns_qr_mask) | ((value) << dns_qr_shift)))
-#define dns_opcode_set(w, value) ((w).bitfield = (((w).bitfield & ~dns_opcode_mask) | ((value) << dns_opcode_shift)))
-#define dns_rcode_set(w, value) ((w).bitfield = (((w).bitfield & ~dns_rcode_mask) | ((value) << dns_rcode_shift)))
+#define dns_qr_set(w, value) ((w)->bitfield = (((w)->bitfield & ~dns_qr_mask) | ((value) << dns_qr_shift)))
+#define dns_opcode_set(w, value) ((w)->bitfield = (((w)->bitfield & ~dns_opcode_mask) | \
+                                                    ((value) << dns_opcode_shift)))
+#define dns_rcode_set(w, value) ((w)->bitfield = (((w)->bitfield & ~dns_rcode_mask) | ((value) << dns_rcode_shift)))
 
 // Query/Response
 #define dns_qr_query           0
@@ -363,6 +364,9 @@ bool dns_name_parse(dns_label_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL mess
 bool dns_rr_parse(dns_rrset_t *NONNULL rrset,
                   dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp, bool rrdata_permitted);
 bool dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message, unsigned len);
+bool dns_names_equal(dns_label_t *NONNULL name1, dns_label_t *NONNULL name2);
+const char *NONNULL dns_name_print(dns_name_t *NONNULL name, char *NONNULL buf, int bufmax);
+bool dns_names_equal_text(dns_label_t *NONNULL name1, const char *NONNULL name2);
 
 // Local Variables:
 // mode: C

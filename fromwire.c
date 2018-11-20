@@ -167,13 +167,10 @@ dns_u32_parse(dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp,
 static void
 dns_name_dump(FILE *outfile, dns_label_t *name)
 {
-    char *prev = "";
-    dns_label_t *lp;
+    char buf[DNS_MAX_LABEL_SIZE + 1];
     
-    for (lp = name; lp; lp = lp->next) {
-        fprintf(outfile, "%s%s", prev, lp->data);
-        prev = ".";
-    }
+    dns_name_print(name, buf, sizeof buf);
+    fputs(buf, outfile);
 }
 
 static void
@@ -495,6 +492,84 @@ dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message
     }
     *ret = rv;
     return true;
+}
+
+const char *NONNULL
+dns_name_print(dns_name_t *NONNULL name, char *buf, int bufmax)
+{
+    dns_label_t *lp;
+    int ix = 0;
+    int len;
+
+    // Copy the labels in one at a time, putting a dot between each one; if there isn't room
+    // in the buffer (shouldn't be the case), copy as much as will fit, leaving room for a NUL
+    // termination.
+    for (lp = name; lp; lp = lp->next) {
+        if (ix != 0) {
+            if (ix + 1 == bufmax) {
+                break;
+            }
+            buf[ix++] = '.';
+        }
+        if (lp->len + ix + 1 > bufmax) {
+            len = bufmax - 1 - ix - lp->len;
+            if (len <= 0) {
+                break;
+            }
+        } else {
+            len = lp->len;
+        }
+        memcpy(buf + ix, lp->data, lp->len);
+        ix += lp->len;
+        if (len != lp->len) {
+            break;
+        }
+    }
+
+    buf[ix++] = 0;
+    return buf;
+}
+
+bool
+dns_names_equal(dns_label_t *NONNULL name1, dns_label_t *NONNULL name2)
+{
+    if (name1->len != name2->len) {
+        return false;
+    }
+    if (name1->len != 0 && memcmp(name1->data, name2->data, name1->len) != 0) {
+        return false;
+    }
+    if (name1->next != NULL && name2->next != NULL) {
+        return dns_names_equal(name1->next, name2->next);
+    }
+    if (name1->next == NULL && name2->next == NULL) {
+        return true;
+    }
+    return false;
+}
+
+// Note that "foo.arpa" is not the same as "foo.arpa."
+bool
+dns_names_equal_text(dns_label_t *NONNULL name1, const char *NONNULL name2)
+{
+    const char *ndot;
+    ndot = strchr(name2, '.');
+    if (ndot == NULL) {
+        ndot = name2 + strlen(name2);
+    }
+    if (name1->len != ndot - name2) {
+        return false;
+    }
+    if (name1->len != 0 && memcmp(name1->data, name2, name1->len) != 0) {
+        return false;
+    }
+    if (name1->next != NULL && *ndot == '.') {
+        return dns_names_equal_text(name1->next, ndot + 1);
+    }
+    if (name1->next == NULL && *ndot == 0) {
+        return true;
+    }
+    return false;
 }
 
 // Local Variables:

@@ -64,8 +64,8 @@ main(int argc, char **argv)
     message.id = (uint32_t)(random()) & 65535;
 #endif
     message.bitfield = 0;
-    dns_qr_set(message, dns_qr_query);
-    dns_opcode_set(message, dns_opcode_update);
+    dns_qr_set(&message, dns_qr_query);
+    dns_opcode_set(&message, dns_opcode_update);
     message.bitfield = htons(message.bitfield);
 
     // Message data...
@@ -100,7 +100,7 @@ main(int argc, char **argv)
     dns_name_to_wire(&p_host_name, &txn, host_name); CH;
     dns_ptr_to_wire(&p_host_name, &txn, &p_zone_name); CH;
     dns_ui16_to_wire(&txn, dns_rrtype_any); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_none); CH;
+    dns_ui16_to_wire(&txn, dns_qclass_any); CH;
     dns_ttl_to_wire(&txn, 0); CH;
     dns_ui16_to_wire(&txn, 0); CH;
     message.nscount++;
@@ -174,7 +174,7 @@ main(int argc, char **argv)
     //      RDLENGTH = 0
     dns_ptr_to_wire(NULL, &txn, &p_service_instance_name); CH;
     dns_ui16_to_wire(&txn, dns_rrtype_any); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_none); CH;
+    dns_ui16_to_wire(&txn, dns_qclass_any); CH;
     dns_ttl_to_wire(&txn, 0); CH;
     dns_ui16_to_wire(&txn, 0); CH;
     message.nscount++;

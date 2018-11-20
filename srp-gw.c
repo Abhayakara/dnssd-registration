@@ -159,7 +159,7 @@ comm_free(comm_t *comm)
         comm->name = NULL;
     }
     if (comm->message) {
-        message_free(comm->message);
+        free(comm->message);
         comm->message = NULL;
         comm->buf = NULL;
     }
@@ -182,11 +182,36 @@ getipaddr(addr_t *addr, const char *p)
     }
 }                
 
-typedef struct dns_host_record dns_host_record_t;
-struct dns_host_record {
-    dns_host_record_t *next;
+typedef struct delete delete_t;
+struct delete {
+    delete_t *next;
+    dns_name_t *name;
+};
+
+typedef struct dns_host_description dns_host_description_t;
+struct dns_host_description {
     dns_name_t *name;
     dns_rrset_t *a, *aaaa, *key;
+    delete_t *delete;
+    int num_instances;
+};
+
+typedef struct service_instance service_instance_t;
+struct service_instance {
+    service_instance_t *next;
+    dns_host_description_t *host_description;
+    dns_name_t *name;
+    delete_t *delete;
+    int num_instances;
+    dns_rrset_t *srv, *txt;
+};
+
+typedef struct service service_t;
+struct service {
+    service_t *next;
+    service_instance_t *instance;
+    dns_name_t *name;
+    dns_rrset_t *rr;
 };
 
 void
@@ -194,8 +219,12 @@ srp_relay(comm_t *comm, dns_message_t *message)
 {
     dns_name_t *update_zone;
     bool updating_services_dot_arpa = false;
-    int i, j;
-    dns_host_record_t *host_records = NULL, *hrp, **hrpp;
+    int i;
+    dns_host_description_t *host_description = NULL;
+    delete_t *deletes = NULL, *dp, **dpp = &deletes;
+    service_instance_t *service_instances = NULL, *sip, **sipp = &service_instances;
+    service_t *services = NULL, *sp, **spp = &services;
+    char namebuf[DNS_MAX_NAME_SIZE + 1], namebuf1[DNS_MAX_NAME_SIZE + 1];
 
     // Update requires a single SOA record as the question
     if (message->qdcount != 1) {
@@ -209,87 +238,243 @@ srp_relay(comm_t *comm, dns_message_t *message)
         return;
     }
 
-    if (message->questions[0].rrtype != dns_rrtype_soa) {
+    if (message->questions[0].type != dns_rrtype_soa) {
         ERROR("srp_relay: update received with rrtype %d instead of SOA in question section.",
-              message->questions[0].rrtype);
+              message->questions[0].type);
         return;
     }
     update_zone = message->questions[0].name;
 
     // What zone are we updating?
-    if (dns_name_equals_text(update_zone, "services.arpa")) {
+    if (dns_names_equal_text(update_zone, "services.arpa")) {
         updating_services_dot_arpa = true;
     }
 
-    // Find all the host records we're updating
-    num_host_records = 0;
-    hrpp = &host_records;
+    // Scan over the RRs; do the delete consistency check.   We can't do other consistency
+    // checks because we can't assume a particular order to the records other than that deletes
+    // have to come before adds.
     for (i = 0; i < message->nscount; i++) {
-        dns_rrtype_t *rr = &message->authority[i];
-        // Every hostname update must be preceded by a delete for the name.
-        // For the delete to be the delete of a hostname, it must precede an A or an AAAA
-        // update; however, the KEY record is also valid here, and could be first, so we
-        // have to check for that as well.   If none of these conditions match, this could
-        // be a delete for a service instance name.
-        if (rr->type == dns_rrtype_any && rr->class == dns_qclass_any && rr->ttl == 0 &&
-            i + 1 < message->nscount &&
-            (rr[1].type == dns_rrtype_a || rr[1].type == dns_rrtype_aaaa ||
-             (i + 2 < message->nscount && rr[1].type == dns_rrtype_key &&
-              (rr[2].type == dns_rrtype_a || rr[2].type == dns_rrtype_aaaa)))) {
-            // There shouldn't already be an entry for this name.
-            for (hrp = host_records; hrp; hrp = hrp->next) {
-                if (dns_names_equal(hrp->name, rr->name)) {
-                    ERROR("srp_relay: delete for %s when the name has already been seen.",
+        dns_rrset_t *rr = &message->authority[i];
+
+        // If this is a delete for all the RRs on a name, record it in the list of deletes.
+        if (rr->type == dns_rrtype_any && rr->qclass == dns_qclass_any && rr->ttl == 0) {
+            for (dp = deletes; dp; dp = dp->next) {
+                if (dns_names_equal(dp->name, rr->name)) {
+                    ERROR("srp_relay: two deletes for the same name: %s",
                           dns_name_print(rr->name, namebuf, sizeof namebuf));
                     goto out;
                 }
             }
-            hrp = calloc(sizeof *hrp, 1);
-            if (!hrp) {
-                ERROR("srp_relay: no memory");
+            dp = calloc(sizeof *dp, 1);
+            if (!dp) {
+                ERROR("srp_relay: no memory.");
                 goto out;
             }
-            *hrpp = hrp;
-            hrpp = *hrp->next;
-        } else if (rr->type == dns_rrtype_a || rr->type == dns_rrtype_aaaa || rr->type == dns_rrtype_key) {
-            for (hrp = host_records; hrp; hrp = hrp->next) {
-                if (dns_names_equal(hrp->name, rr->name)) {
+            dp->name = rr->name;
+            *dpp = dp;
+            dpp = &dp->next;
+        }
+
+        // Otherwise if it's an A or AAAA record, it's part of a hostname entry.
+        else if (rr->type == dns_rrtype_a || rr->type == dns_rrtype_aaaa || rr->type == dns_rrtype_key) {
+            // Allocate the hostname record
+            if (!host_description) {
+                host_description = calloc(sizeof *host_description, 1);
+                if (!host_description) {
+                    ERROR("srp_relay: no memory");
+                    goto out;
+                }
+            }
+
+            // Make sure it's preceded by a deletion of all the RRs on the name.
+            if (!host_description->delete) {
+                for (dp = deletes; dp; dp = dp->next) {
+                    if (dns_names_equal(dp->name, rr->name)) {
+                        break;
+                    }
+                }
+                if (dp == NULL) {
+                    ERROR("srp_relay: ADD for hostname %s without a preceding delete.",
+                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+                host_description->delete = dp;
+                host_description->name = dp->name;
+            }
+                          
+            if (rr->type == dns_rrtype_a) {
+                if (host_description->a != NULL) {
+                    ERROR("srp_relay: more than one A rrset received for name: %s",
+                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+                host_description->a = rr;
+            } else if (rr->type == dns_rrtype_aaaa) {
+                if (host_description->aaaa != NULL) {
+                    ERROR("srp_relay: more than one AAAA rrset received for name: %s",
+                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+                host_description->aaaa = rr;
+            } else if (rr->type == dns_rrtype_key) {
+                if (host_description->key != NULL) {
+                    ERROR("srp_relay: more than one KEY rrset received for name: %s",
+                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+                host_description->key =  rr;
+            }
+        }
+
+        // Otherwise if it's an SRV entry, that should be a service instance name.
+        else if (rr->type == dns_rrtype_srv || rr->type == dns_rrtype_txt) {
+            // Should be a delete that precedes this service instance.
+            for (dp = deletes; dp; dp = dp->next) {
+                if (dns_names_equal(dp->name, rr->name)) {
                     break;
                 }
             }
-            // If we didn't find a match, it means that there was no delete for this record.
-            if (hrp == NULL) {
-                ERROR("srp_relay: name %s appears without a preceding delete.",
-                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+            if (dp == NULL) {
+                ERROR("srp_relay: ADD for service instance not preceded by delete: %s",
+                      dns_name_print(rr->name, namebuf, sizeof namebuf));
                 goto out;
             }
-            if (rr->type == dns_rrtype_a) {
-                if (hrp->a != NULL) {
-                    ERROR("srp_relay: more than one A rrset received for name: ",
-                          dns_name_print(hrp->name, namebuf, sizeof namebuf));
-                    goto out;
+            for (sip = service_instances; sip; sip = sip->next) {
+                if (dns_names_equal(sip->name, rr->name)) {
+                    break;
                 }
-                hrp->a = rr;
-            } else if (rr->type == dns_rrtype_aaaa) {
-                if (hrp->aaaa != NULL) {
-                    ERROR("srp_relay: more than one AAAA rrset received for name: ",
-                          dns_name_print(hrp->name, namebuf, sizeof namebuf));
-                    goto out;
-                }
-                hrp->aaaa = rr;
-            } else if (rr->type == dns_rrtype_key) {
-                if (hrp->key != NULL) {
-                    ERROR("srp_relay: more than one KEY rrset received for name: ",
-                          dns_name_print(hrp->name, namebuf, sizeof namebuf));
-                    goto out;
-                }
-                hrp->key =  rr;
             }
+            if (!sip) {
+                sip = calloc(sizeof *sip, 1);
+                if (sip == NULL) {
+                    ERROR("srp_relay: no memory");
+                    goto out;
+                }
+                sip->delete = dp;
+                sip->name = dp->name;
+                *sipp = sip;
+                sipp = &sip->next;
+            }
+            if (rr->type == dns_rrtype_srv) {
+                if (sip->srv != NULL) {
+                    ERROR("srp_relay: more than one SRV rr received for service instance: %s",
+                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+                    goto out;
+                }
+                sip->srv = rr;
+            } else if (rr->type == dns_rrtype_txt) {
+                if (sip->txt != NULL) {
+                    ERROR("srp_relay: more than one SRV rr received for service instance: %s",
+                          dns_name_print(rr->name, namebuf, sizeof namebuf));
+                }
+                sip->txt = rr;
+            }
+        }
+
+        // Otherwise if it's a PTR entry, that should be a service name
+        else if (rr->type == dns_rrtype_ptr) {
+            sp = calloc(sizeof *sp, 1);
+            if (sp == NULL) {
+                ERROR("srp_relay: no memory");
+                goto out;
+            }
+            sp->rr = rr;
+            *spp = sp;
+            spp = &sp->next;
+        }            
+
+        // Otherwise it's not a valid update
+        else {
+            ERROR("srp_relay: unexpected rrtype %d on %s in update.", rr->type,
+                      dns_name_print(rr->name, namebuf, sizeof namebuf));
+            goto out;
         }
     }
 
-    // Find all service instances.
+    // Now that we've scanned the whole update, do the consistency checks for updates that might
+    // not have come in order.
     
+    // First, make sure there's a host description.
+    if (host_description == NULL) {
+        ERROR("srp_relay: SRP update does not include a host description.");
+        goto out;
+    }
+
+    // Make sure that each service add references a service instance that's in the same update.
+    for (sp = services; sp; sp = sp->next) {
+        for (sip = service_instances; sip; sip = sip->next) {
+            if (dns_names_equal(sip->name, sp->rr->data.ptr.name)) {
+                // Note that we have already verified that there is only one service instance
+                // with this name, so this could only ever happen once in this loop even without
+                // the break statement.
+                sp->instance = sip;
+                sip->num_instances++;
+                break;
+            }
+        }
+        // If this service doesn't point to a service instance that's in the update, then the
+        // update fails validation.
+        if (sip == NULL) {
+            ERROR("srp_relay: service %s points to an instance that's not included: %s",
+                  dns_name_print(sp->name, namebuf, sizeof namebuf),
+                  dns_name_print(sip->name, namebuf1, sizeof namebuf1));
+            goto out;
+        }
+    }
+
+    for (sip = service_instances; sip; sip = sip->next) {
+        // For each service instance, make sure that at least one service references it
+        if (sip->num_instances == 0) {
+            ERROR("srp_relay: service instance update for %s is not referenced by a service update.",
+                  dns_name_print(sip->name, namebuf, sizeof namebuf));
+            goto out;
+        }
+
+        // For each service instance, make sure that it references the host description
+        if (dns_names_equal(host_description->name, sip->srv->data.srv.name)) {
+            sip->host_description = host_description;
+            host_description->num_instances++;
+        }
+    }
+
+    // Make sure that at least one service instance references the host description
+    if (host_description->num_instances == 0) {
+        ERROR("srp_relay: host description %s is not referenced by any service instances.",
+              dns_name_print(host_description->name, namebuf, sizeof namebuf));
+    }
+
+    // Make sure the host description has at least one address record.
+    if (host_description->a == NULL && host_description->aaaa == NULL) {
+        ERROR("srp_relay: host description %s doesn't contain any IP addresses.",
+              dns_name_print(host_description->name, namebuf, sizeof namebuf));
+              
+    }
+    // And make sure it has a key record
+    if (host_description->key == NULL) {
+        ERROR("srp_relay: host description %s doesn't contain a key.",
+              dns_name_print(host_description->name, namebuf, sizeof namebuf));
+    }
+
+out:
+    // free everything we allocated but (it turns out) aren't going to use
+    for (dp = deletes; dp; ) {
+        delete_t *next = dp->next;
+        free(dp);
+        dp = next;
+    }
+    for (sip = service_instances; sip; ) {
+        service_instance_t *next = sip->next;
+        free(sip);
+        sip = next;
+    }
+    for (sp = services; sp; ) {
+        service_t *next = sp->next;
+        free(sp);
+        sp = next;
+    }
+    if (host_description != NULL) {
+        free(host_description);
+    }
 }
 
 void
@@ -297,14 +482,17 @@ dns_evaluate(comm_t *comm)
 {
     dns_message_t *message;
 
+    // Byte swap the bitfield before doing math on it.
+    comm->message->wire.bitfield = ntohs(comm->message->wire.bitfield);
+
     // Drop incoming responses--we're a server, so we only accept queries.
-    if (dns_qr_get(comm->message->bitfield) == dns_qr_response) {
+    if (dns_qr_get(&comm->message->wire) == dns_qr_response) {
         return;
     }
 
     // Forward incoming messages that are queries but not updates.
     // XXX do this later--for now we operate only as a translator, not a proxy.
-    if (dns_opcode_get(comm->message->bitfield) != dns_opcode_update) {
+    if (dns_opcode_get(&comm->message->wire) != dns_opcode_update) {
         // dns_forward(comm);
         return;
     }
@@ -316,7 +504,7 @@ dns_evaluate(comm_t *comm)
     }
     
     srp_relay(comm, message);
-    dns_message_free(message);
+    //dns_message_free(message);
 }
 
 void dns_input(comm_t *comm)
