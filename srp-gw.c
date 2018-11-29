@@ -52,12 +52,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/event.h>
+#include <fcntl.h>
 
 #define USE_KQUEUE // XXX
-
-#define ERROR(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
-#define INFO(fmt, ...)  fprintf(stderr, fmt "\n", ##__VA_ARGS__)
-#define DEBUG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
 #pragma mark structures
 
@@ -759,7 +756,6 @@ listen_callback(comm_t *listener)
 comm_t *
 setup_listener_socket(int family, int protocol, const char *name)
 {
-    addr_t addr;
     comm_t *listener;
     socklen_t sl;
     int rv;
@@ -787,17 +783,16 @@ setup_listener_socket(int family, int protocol, const char *name)
         return NULL;
     }
 
-    memset(&addr, 0, sizeof addr);
     if (family == AF_INET) {
-        sl = sizeof addr.sin;
-        addr.sin.sin_port = htons(53);
+        sl = sizeof listener->address.sin;
+        listener->address.sin.sin_port = htons(53);
     } else {
-        sl = sizeof addr.sin6;
-        addr.sin6.sin6_port = htons(53);
+        sl = sizeof listener->address.sin6;
+        listener->address.sin6.sin6_port = htons(53);
     }
-    addr.sa.sa_family = family;
-    addr.sa.sa_len = sl;
-    if (bind(listener->sock, &addr.sa, sl) < 0) {
+    listener->address.sa.sa_family = family;
+    listener->address.sa.sa_len = sl;
+    if (bind(listener->sock, &listener->address.sa, sl) < 0) {
         ERROR("Can't bind to 0#53/%s%s: %s",
                 protocol == IPPROTO_UDP ? "udp" : "tcp", family == AF_INET ? "v4" : "v6",
                 strerror(errno));
@@ -839,13 +834,14 @@ main(int argc, char **argv)
     udp_validator_t *NULLABLE *NONNULL up = &udp_validators;
     subnet_t *NULLABLE *NONNULL nt = &tcp_validators;
     subnet_t *NULLABLE *NONNULL sp;
-    addr_t server, pref;
+    addr_t server, pref, foo;
     uint16_t port;
     socklen_t len, prefalen;
     char *s, *p;
     int width;
     comm_t *listener;
     struct timespec to;
+    int sock, result;
 
     // Read the configuration from the command line.
     for (i = 1; i < argc; i++) {
@@ -987,6 +983,27 @@ main(int argc, char **argv)
     listener->next = comms;
     comms = listener;
     
+    sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+	result = fcntl(sock, F_GETFL, 0);
+	if (result < 0) {
+		INFO("F_GETFL failed: %s", strerror(errno));
+        goto skip;
+	}
+	result = fcntl(sock, F_SETFL, result | O_NONBLOCK);
+	if (result < 0) {
+		ERROR("F_SETFL failed: %s", strerror(errno));
+        goto skip;
+	}
+
+    memset(&foo, 0, sizeof foo);
+    foo.sa.sa_family = AF_INET6;
+    foo.sa.sa_len = sizeof foo.sin6;
+    foo.sin6.sin6_port = htons(53);
+    inet_pton(AF_INET6, "::1", &foo.sin6.sin6_addr);
+    result = connect(sock, &foo.sa, sizeof foo.sin6);
+    printf("return status from connect: %s\n", result < 0 ? strerror(errno) : "SUCCESS");
+
+skip:
     do {
         int something = 0;
         to.tv_sec = 1;

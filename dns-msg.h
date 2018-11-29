@@ -302,6 +302,10 @@ struct dns_message {
 #define dns_opt_chain         13 // [RFC7901]
 #define dns_opt_key_tag       14 // [RFC8145]
 
+#define ERROR(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define INFO(fmt, ...)  fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define DEBUG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+
 // towire.c:
 
 uint16_t srp_random16(void);
