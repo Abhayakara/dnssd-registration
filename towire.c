@@ -463,7 +463,7 @@ dns_sig0_signature_to_wire(dns_transaction_t *NONNULL txn,
 
 int
 dns_send_to_server(dns_transaction_t *NONNULL txn,
-                   const char *NONNULL anycast_address,
+                   const char *NONNULL anycast_address, uint16_t port,
                    dns_response_callback_t NONNULL callback)
 {
     union {
@@ -481,11 +481,11 @@ dns_send_to_server(dns_transaction_t *NONNULL txn,
         // Try IPv4 first because IPv6 addresses are never valid IPv4 addresses
         if (inet_pton(AF_INET, anycast_address, &addr.sin.sin_addr)) {
             addr.sin.sin_family = AF_INET;
-            addr.sin.sin_port = htons(9999);
+            addr.sin.sin_port = htons(port);
             len = sizeof addr.sin;
         } else if (inet_pton(AF_INET6, anycast_address, &addr.sin6.sin6_addr)) {
             addr.sin6.sin6_family = AF_INET6;
-            addr.sin6.sin6_port = htons(9999);
+            addr.sin6.sin6_port = htons(port);
             len = sizeof addr.sin6;
         } else {
             txn->error = EPROTONOSUPPORT;

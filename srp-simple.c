@@ -45,8 +45,8 @@ main(int argc, char **argv)
     const char *a_record = "127.0.0.1";
     const char *aaaa_record = "::1";
     const char *txt_record = "0";
-//    const char *anycast_address = "127.0.0.1";
-    const char *anycast_address = "73.186.137.119"; // cer.fugue.com
+    const char *anycast_address = "127.0.0.1";
+//    const char *anycast_address = "73.186.137.119"; // cer.fugue.com
     const char *keyfile_name = "srp-simple.key";
     int port = 9992;
     srp_key_t *key;
@@ -254,7 +254,7 @@ main(int argc, char **argv)
     message.arcount = htons(ntohs(message.arcount) + 1);
 
     // Send the update
-    if (dns_send_to_server(&txn, anycast_address, dns_response_callback) < 0) {
+    if (dns_send_to_server(&txn, anycast_address, 53, dns_response_callback) < 0) {
         line = __LINE__;
     fail:
         printf("dns_send_to_server failed: %s at line %d\n", strerror(txn.error), line);

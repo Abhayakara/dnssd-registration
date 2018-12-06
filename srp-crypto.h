@@ -60,6 +60,10 @@ int srp_mbedtls_sha256_finish_ret(mbedtls_sha256_context *NONNULL sha, uint8_t *
 #define ECDSA_SHA256_SIG_SIZE 64
 #define ECDSA_SHA256_SIG_PART_SIZE 32
 
+#define SIG_HEADERLEN 11
+#define SIG_STATIC_RDLEN 18
+
+
 #define dnssec_keytype_ecdsa  13
 
 // sign_*.c:

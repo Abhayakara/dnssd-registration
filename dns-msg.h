@@ -119,7 +119,7 @@ struct dns_rrset {
             uint32_t inception;
             uint16_t key_tag;
             dns_label_t *NONNULL signer;
-            int start, hdrlen;
+            int start;
             int len;
             uint8_t *NONNULL signature;
         } sig;
@@ -370,7 +370,7 @@ void dns_sig0_signature_to_wire(dns_transaction_t *NONNULL txn,
                                 dns_name_pointer_t *NONNULL signer,
                                 const char *NONNULL signer_fqdn);
 int dns_send_to_server(dns_transaction_t *NONNULL txn,
-                       const char *NONNULL anycast_address,
+                       const char *NONNULL anycast_address, uint16_t port,
                        dns_response_callback_t NONNULL callback);
 
 // fromwire.c:
@@ -384,7 +384,8 @@ bool dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL me
 bool dns_names_equal(dns_label_t *NONNULL name1, dns_label_t *NONNULL name2);
 const char *NONNULL dns_name_print(dns_name_t *NONNULL name, char *NONNULL buf, int bufmax);
 bool dns_names_equal_text(dns_label_t *NONNULL name1, const char *NONNULL name2);
-
+size_t dns_name_wire_length(dns_label_t *NONNULL name);
+size_t dns_name_to_wire_canonical(uint8_t *NONNULL buf, size_t max, dns_label_t *NONNULL name);
 #endif // _DNS_MSG_H
 
 // Local Variables:

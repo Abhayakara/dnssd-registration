@@ -43,6 +43,8 @@ srp_sig0_verify(dns_wire_t *message, dns_rr_t *key, dns_rr_t *signature)
     char errbuf[128];
     uint8_t hash[ECDSA_SHA256_HASH_SIZE];
     mbedtls_mpi r, s;
+    uint8_t *rdata;
+    size_t rdlen;
 
     // The key algorithm and the signature algorithm have to match or we can't validate the signature.
     if (key->data.key.algorithm != signature->data.sig.algorithm) {
@@ -91,12 +93,29 @@ srp_sig0_verify(dns_wire_t *message, dns_rr_t *key, dns_rr_t *signature)
     // The hash is across the message _before_ the SIG RR is added, so we have to decrement arcount before
  	// computing it.
     message->arcount = htons(ntohs(message->arcount) - 1);
+
+    // And the SIG RRDATA that we hash includes the canonical version of the name, not whatever bits
+    // are in the actual wire format message, so we have to just make a copy of it.
+    rdlen = SIG_STATIC_RDLEN + dns_name_wire_length(signature->data.sig.signer);
+    rdata = malloc(rdlen);
+    if (rdata == NULL) {
+        ERROR("no memory for SIG RR canonicalization");
+        return 0;
+    }
+    memcpy(rdata, &message->data[signature->data.sig.start + SIG_HEADERLEN], SIG_STATIC_RDLEN);
+    if (!dns_name_to_wire_canonical(rdata + SIG_STATIC_RDLEN, rdlen - SIG_STATIC_RDLEN,
+                                    signature->data.sig.signer)) {
+        // Should never happen.
+        ERROR("dns_name_wire_length and dns_name_to_wire_canonical got different lengths!");
+        return 0;
+    }
+
     // First compute the hash across the SIG RR, then hash the message up to the SIG RR
     if ((status = mbedtls_sha256_starts_ret(&sha, 0)) != 0 ||
-        (status = srp_mbedtls_sha256_update_ret(&sha, &message->data[signature->data.sig.start],
-                                                signature->data.sig.hdrlen) != 0) ||
+        (status = srp_mbedtls_sha256_update_ret(&sha, rdata, rdlen)) != 0 ||
         (status = srp_mbedtls_sha256_update_ret(&sha, (uint8_t *)message,
-                                                signature->data.sig.start + (sizeof *message) - DNS_DATA_SIZE)) != 0 ||
+                                                signature->data.sig.start +
+                                                (sizeof *message) - DNS_DATA_SIZE)) != 0 ||
         (status = srp_mbedtls_sha256_finish_ret(&sha, hash)) != 0) {
         // Put it back
         message->arcount = htons(ntohs(message->arcount) + 1);
@@ -105,6 +124,7 @@ srp_sig0_verify(dns_wire_t *message, dns_rr_t *key, dns_rr_t *signature)
         return 0;
     }
     message->arcount = htons(ntohs(message->arcount) + 1);
+    free(rdata);
     
     // Now check the signature against the hash
     status = mbedtls_ecdsa_verify(&group, hash, sizeof hash, &pubkey, &r, &s);

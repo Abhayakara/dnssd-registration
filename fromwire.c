@@ -323,7 +323,7 @@ dns_rdata_parse(dns_rr_t *NONNULL rr,
         break;
 
     case dns_rrtype_sig:
-        rr->data.sig.start = *offp;
+        rr->data.sig.start = rrstart;
         if (!dns_u16_parse(message, len, offp, &rr->data.sig.type) ||
             !dns_u8_parse(message, len, offp, &rr->data.sig.algorithm) ||
             !dns_u8_parse(message, len, offp, &rr->data.sig.label) ||
@@ -336,7 +336,6 @@ dns_rdata_parse(dns_rr_t *NONNULL rr,
         }
         // The signature is what's left of the RRDATA.  It covers the message up to the signature, so we
         // remember where it starts so as to know what memory to cover to validate it.
-        rr->data.sig.hdrlen = *offp - rrstart;
         rr->data.sig.len = target - *offp;
         rr->data.sig.signature = malloc(rr->data.sig.len);
         if (!rr->data.sig.signature) {
@@ -663,6 +662,50 @@ dns_names_equal_text(dns_label_t *NONNULL name1, const char *NONNULL name2)
     }
     return false;
 }
+
+// Find the length of a name in uncompressed wire format.
+// This is in fromwire because we use it for validating signatures, and don't need it for
+// sending.
+static size_t
+dns_name_wire_length_in(dns_label_t *NONNULL name, size_t ret)
+{
+    // Root label.
+    if (name == NULL)
+        return ret;
+    return dns_name_wire_length_in(name->next, ret + name->len + 1);
+}
+
+size_t
+dns_name_wire_length(dns_label_t *NONNULL name)
+{
+    return dns_name_wire_length_in(name, 0);
+}
+
+// Copy a name we've parsed from a message out in canonical wire format so that we can
+// use it to verify a signature.   As above, not actually needed for copying to a message
+// we're going to send, since in that case we want to try to compress.
+static size_t
+dns_name_to_wire_canonical_in(uint8_t *NONNULL buf, size_t max, size_t ret, dns_label_t *NONNULL name)
+{
+    if (name == NULL) {
+        return ret;
+    }
+    if (max < name->len + 1) {
+        return 0;
+    }
+    *buf = name->len;
+    memcpy(buf + 1, name->data, name->len);
+    return dns_name_to_wire_canonical_in(buf + name->len + 1,
+                                         max - name->len - 1, ret + name->len + 1, name->next);
+}
+
+size_t
+dns_name_to_wire_canonical(uint8_t *NONNULL buf, size_t max, dns_label_t *NONNULL name)
+{
+    return dns_name_to_wire_canonical_in(buf, max, 0, name);
+}
+    
+
 
 // Local Variables:
 // mode: C
