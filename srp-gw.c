@@ -42,7 +42,6 @@
 
 #define __APPLE_USE_RFC_3542
 
-#include "dns-msg.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -53,6 +52,11 @@
 #include <arpa/inet.h>
 #include <sys/event.h>
 #include <fcntl.h>
+#include <sys/time.h>
+
+#include "srp.h"
+#include "dns-msg.h"
+#include "srp-crypto.h"
 
 #define USE_KQUEUE // XXX
 
@@ -188,7 +192,7 @@ struct delete {
 typedef struct dns_host_description dns_host_description_t;
 struct dns_host_description {
     dns_name_t *name;
-    dns_rrset_t *a, *aaaa, *key;
+    dns_rr_t *a, *aaaa, *key;
     delete_t *delete;
     int num_instances;
 };
@@ -200,7 +204,7 @@ struct service_instance {
     dns_name_t *name;
     delete_t *delete;
     int num_instances;
-    dns_rrset_t *srv, *txt;
+    dns_rr_t *srv, *txt;
 };
 
 typedef struct service service_t;
@@ -208,10 +212,10 @@ struct service {
     service_t *next;
     service_instance_t *instance;
     dns_name_t *name;
-    dns_rrset_t *rr;
+    dns_rr_t *rr;
 };
 
-void
+bool
 srp_relay(comm_t *comm, dns_message_t *message)
 {
     dns_name_t *update_zone;
@@ -221,24 +225,27 @@ srp_relay(comm_t *comm, dns_message_t *message)
     delete_t *deletes = NULL, *dp, **dpp = &deletes;
     service_instance_t *service_instances = NULL, *sip, **sipp = &service_instances;
     service_t *services = NULL, *sp, **spp = &services;
+    dns_rr_t *signature;
     char namebuf[DNS_MAX_NAME_SIZE + 1], namebuf1[DNS_MAX_NAME_SIZE + 1];
+    bool ret = false;
+    struct timeval now;
 
     // Update requires a single SOA record as the question
     if (message->qdcount != 1) {
         ERROR("srp_relay: update received with qdcount > 1");
-        return;
+        return false;
     }
 
     // Update should contain zero answers.
     if (message->ancount != 0) {
         ERROR("srp_relay: update received with ancount > 0");
-        return;
+        return false;
     }
 
     if (message->questions[0].type != dns_rrtype_soa) {
         ERROR("srp_relay: update received with rrtype %d instead of SOA in question section.",
               message->questions[0].type);
-        return;
+        return false;
     }
     update_zone = message->questions[0].name;
 
@@ -247,11 +254,11 @@ srp_relay(comm_t *comm, dns_message_t *message)
         updating_services_dot_arpa = true;
     }
 
-    // Scan over the RRs; do the delete consistency check.   We can't do other consistency
-    // checks because we can't assume a particular order to the records other than that deletes
-    // have to come before adds.
+    // Scan over the authority RRs; do the delete consistency check.  We can't do other consistency checks
+    // because we can't assume a particular order to the records other than that deletes have to come before
+    // adds.
     for (i = 0; i < message->nscount; i++) {
-        dns_rrset_t *rr = &message->authority[i];
+        dns_rr_t *rr = &message->authority[i];
 
         // If this is a delete for all the RRs on a name, record it in the list of deletes.
         if (rr->type == dns_rrtype_any && rr->qclass == dns_qclass_any && rr->ttl == 0) {
@@ -438,19 +445,69 @@ srp_relay(comm_t *comm, dns_message_t *message)
     if (host_description->num_instances == 0) {
         ERROR("srp_relay: host description %s is not referenced by any service instances.",
               dns_name_print(host_description->name, namebuf, sizeof namebuf));
+        goto out;
     }
 
     // Make sure the host description has at least one address record.
     if (host_description->a == NULL && host_description->aaaa == NULL) {
         ERROR("srp_relay: host description %s doesn't contain any IP addresses.",
               dns_name_print(host_description->name, namebuf, sizeof namebuf));
-              
+        goto out;
     }
     // And make sure it has a key record
     if (host_description->key == NULL) {
         ERROR("srp_relay: host description %s doesn't contain a key.",
               dns_name_print(host_description->name, namebuf, sizeof namebuf));
+        goto out;
     }
+
+    // The signature should be the last thing in the additional section.   Even if the signature
+    // is valid, if it's not at the end we reject it.   Note that we are just checking for SIG(0)
+    // so if we don't find what we're looking for, we forward it to the DNS auth server which
+    // will either accept or reject it.
+    if (message->arcount < 1) {
+        ERROR("srp_relay: signature not present");
+        goto out;
+    }
+    signature = &message->additional[message->arcount -1];
+    if (signature->type != dns_rrtype_sig) {
+        ERROR("srp_relay: signature is not at the end or is not present");
+        goto out;
+    }
+
+    // Make sure that the signer name is the hostname.   If it's not, it could be a legitimate
+    // update with a different key, but it's not an SRP update, so we pass it on.
+    if (!dns_names_equal(signature->data.sig.signer, host_description->name)) {
+        ERROR("srp_relay: signer %s doesn't match host %s", 
+              dns_name_print(signature->data.sig.signer, namebuf, sizeof namebuf),
+              dns_name_print(host_description->name, namebuf1, sizeof namebuf1));
+        goto out;
+    }
+    
+    // Make sure we're in the time limit for the signature.   Zeroes for the inception and expiry times
+    // mean the host that send this doesn't have a working clock.   One being zero and the other not isn't
+    // valid unless it's 1970.
+    if (signature->data.sig.inception != 0 || signature->data.sig.expiry != 0) {
+        gettimeofday(&now, NULL);
+        // The sender does the bracketing, so we can just do a simple comparison.
+        if (now.tv_sec > signature->data.sig.expiry || now.tv_sec < signature->data.sig.inception) {
+            ERROR("signature is not timely: %lu < %lu < %lu does not hold",
+                  (unsigned long)signature->data.sig.inception, (unsigned long)now.tv_sec,
+                  (unsigned long)signature->data.sig.expiry);
+            goto badsig;
+        }
+    }
+
+    // Now that we have the key, we can validate the signature.   If the signature doesn't validate,
+    // there is no need to pass the message on.
+    if (!srp_sig0_verify(message->wire, host_description->key, signature)) {
+        ERROR("signature is not valid");
+        goto badsig;
+    }
+
+badsig:
+    // True means we consumed it, not that it was valid.
+    ret = true;
 
 out:
     // free everything we allocated but (it turns out) aren't going to use
@@ -472,15 +529,13 @@ out:
     if (host_description != NULL) {
         free(host_description);
     }
+    return ret;
 }
 
 void
 dns_evaluate(comm_t *comm)
 {
     dns_message_t *message;
-
-    // Byte swap the bitfield before doing math on it.
-    comm->message->wire.bitfield = ntohs(comm->message->wire.bitfield);
 
     // Drop incoming responses--we're a server, so we only accept queries.
     if (dns_qr_get(&comm->message->wire) == dns_qr_response) {
@@ -500,7 +555,15 @@ dns_evaluate(comm_t *comm)
         return;
     }
     
-    srp_relay(comm, message);
+    // We need the wire message to validate the signature...
+    message->wire = &comm->message->wire;
+    if (!srp_relay(comm, message)) {
+        // The message wasn't invalid, but wasn't an SRP message.
+        // dns_forward(comm)
+    }
+    // But we don't save it.
+    message->wire = NULL;
+
     //dns_message_free(message);
 }
 
@@ -834,7 +897,7 @@ main(int argc, char **argv)
     udp_validator_t *NULLABLE *NONNULL up = &udp_validators;
     subnet_t *NULLABLE *NONNULL nt = &tcp_validators;
     subnet_t *NULLABLE *NONNULL sp;
-    addr_t server, pref, foo;
+    addr_t server, pref;
     uint16_t port;
     socklen_t len, prefalen;
     char *s, *p;
@@ -880,7 +943,7 @@ main(int argc, char **argv)
                 *up = calloc(1, sizeof **up);
                 if (*up == NULL) {
                     ERROR("udp_validators: out of memory.");
-                 	return usage(argv[0]);
+                    return usage(argv[0]);
                 }
                 (*up)->ifname = strdup(argv[i]);
                 if ((*up)->ifname == NULL) {
@@ -984,24 +1047,16 @@ main(int argc, char **argv)
     comms = listener;
     
     sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-	result = fcntl(sock, F_GETFL, 0);
-	if (result < 0) {
-		INFO("F_GETFL failed: %s", strerror(errno));
+    result = fcntl(sock, F_GETFL, 0);
+    if (result < 0) {
+        INFO("F_GETFL failed: %s", strerror(errno));
         goto skip;
-	}
-	result = fcntl(sock, F_SETFL, result | O_NONBLOCK);
-	if (result < 0) {
-		ERROR("F_SETFL failed: %s", strerror(errno));
+    }
+    result = fcntl(sock, F_SETFL, result | O_NONBLOCK);
+    if (result < 0) {
+        ERROR("F_SETFL failed: %s", strerror(errno));
         goto skip;
-	}
-
-    memset(&foo, 0, sizeof foo);
-    foo.sa.sa_family = AF_INET6;
-    foo.sa.sa_len = sizeof foo.sin6;
-    foo.sin6.sin6_port = htons(53);
-    inet_pton(AF_INET6, "::1", &foo.sin6.sin6_addr);
-    result = connect(sock, &foo.sa, sizeof foo.sin6);
-    printf("return status from connect: %s\n", result < 0 ? strerror(errno) : "SUCCESS");
+    }
 
 skip:
     do {

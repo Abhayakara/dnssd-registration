@@ -31,7 +31,13 @@
 #include <sys/errno.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include "srp.h"
 #include "dns-msg.h"
+#include "srp-crypto.h"
+
+#ifndef NO_CLOCK
+#include <sys/time.h>
+#endif
 
 // Convert a name to wire format.   Does not store the root label (0) at the end.
 void
@@ -154,9 +160,22 @@ dns_ptr_to_wire(dns_name_pointer_t *NULLABLE r_pointer,
     }
 }
 
+void
+dns_u8_to_wire(dns_transaction_t *NONNULL txn,
+                 uint8_t val)
+{
+    if (!txn->error) {
+        if (txn->p + 1 >= txn->lim) {
+            txn->error = ENOBUFS;
+            return;
+        }
+        *txn->p++ = val;
+    }
+}
+
 // Store a 16-bit integer in network byte order
 void
-dns_ui16_to_wire(dns_transaction_t *NONNULL txn,
+dns_u16_to_wire(dns_transaction_t *NONNULL txn,
                  uint16_t val)
 {
     if (!txn->error) {
@@ -170,7 +189,7 @@ dns_ui16_to_wire(dns_transaction_t *NONNULL txn,
 }
 
 void
-dns_ui32_to_wire(dns_transaction_t *NONNULL txn,
+dns_u32_to_wire(dns_transaction_t *NONNULL txn,
                  uint32_t val)
 {
     if (!txn->error) {
@@ -194,7 +213,7 @@ dns_ttl_to_wire(dns_transaction_t *NONNULL txn,
             txn->error = EINVAL;
             return;
         }
-        dns_ui32_to_wire(txn, (uint32_t)val);
+        dns_u32_to_wire(txn, (uint32_t)val);
     }
 }
 
@@ -263,32 +282,43 @@ dns_rdata_aaaa_to_wire(dns_transaction_t *NONNULL txn,
     }
 }
 
-void
+uint16_t
 dns_rdata_key_to_wire(dns_transaction_t *NONNULL txn,
                       unsigned key_type,
                       unsigned name_type,
                       unsigned signatory,
-                      unsigned protocol,
-                      unsigned algorithm,
-                      uint8_t *NONNULL key,
-                      int key_len)
+                      srp_key_t *key)
 {
+    int key_len = srp_pubkey_length(key);
+    uint8_t *rdata = txn->p;
+    uint32_t key_tag;
+    int i, rdlen;
+    
     if (!txn->error) {
-        if (key_type > 3 || name_type > 3 || signatory > 15 || protocol > 255 || algorithm > 255) {
+        if (key_type > 3 || name_type > 3 || signatory > 15) {
             txn->error = EINVAL;
-            return;
+            return 0;
         }
         if (txn->p + key_len + 4 >= txn->lim) {
             txn->error = ENOBUFS;
-            return;
+            return 0;
         }
         *txn->p++ = (key_type << 6) | name_type;
         *txn->p++ = signatory;
-        *txn->p++ = protocol;
-        *txn->p++ = algorithm;
-        memcpy(txn->p, key, key_len);
+        *txn->p++ = 3; // protocol type is always 3
+        *txn->p++ = srp_key_algorithm(key);
+        srp_pubkey_copy(txn->p, key_len, key);
         txn->p += key_len;
     }
+    rdlen = txn->p - rdata;
+
+    // Compute the key tag
+    key_tag = 0;
+    for (i = 0; i < rdlen; i++) {
+        key_tag += (i & 1) ? rdata[i] : rdata[i] << 8;
+    }
+    key_tag += (key_tag >> 16) & 0xFFFF;
+    return (uint16_t)(key_tag & 0xFFFF);
 }
 
 void
@@ -324,8 +354,8 @@ dns_edns0_header_to_wire(dns_transaction_t *NONNULL txn,
             return;
         }
         *txn->p++ = 0; // root label
-        dns_ui16_to_wire(txn, dns_rrtype_opt);
-        dns_ui16_to_wire(txn, mtu);
+        dns_u16_to_wire(txn, dns_rrtype_opt);
+        dns_u16_to_wire(txn, mtu);
         *txn->p++ = xrcode;
         *txn->p++ = version;
         *txn->p++ = DO << 7;	// flags (usb)
@@ -368,40 +398,65 @@ dns_edns0_option_end(dns_transaction_t *NONNULL txn)
 
 void
 dns_sig0_signature_to_wire(dns_transaction_t *NONNULL txn,
-                           unsigned algorithm,
-                           const uint8_t *NONNULL private_key,
-                           int private_key_len,
-                           dns_name_pointer_t *NONNULL signer)
+                           srp_key_t *key,
+                           uint16_t key_tag,
+                           dns_name_pointer_t *NONNULL signer,
+                           const char *NONNULL signer_fqdn)
 {
+    int siglen = srp_signature_length(key);
+    uint8_t *start, *p_signer, *p_signature, *rrstart = txn->p;
+#ifndef NO_CLOCK
+    struct timeval now;
+#endif
+
     // 1 name (root)
     // 2 type (SIG)
     // 2 class (0)
     // 4 TTL (0)
     // 18 SIG RDATA up to signer name
-    // 2 signer name
-    // 64 signature data (depends on algorithm, we're assuming a 256-bit hash until actual code is written)
-    // 93 bytes total
+    // 2 signer name (always a pointer)
+    // 29 bytes so far
+    // signature data (depends on algorithm, e.g. 64 for ECDSASHA256)
+    // so e.g. 93 bytes total
     
     if (!txn->error) {
-        if (txn->p + 93 >= txn->lim) {
-            txn->error = ENOBUFS;
-            return;
-        }
-        *txn->p++ = 0;	// root label
-        dns_ui16_to_wire(txn, dns_rrtype_sig);
-        dns_ui16_to_wire(txn, 0); // class
+        dns_u8_to_wire(txn, 0);	// root label
+        dns_u16_to_wire(txn, dns_rrtype_sig);
+        dns_u16_to_wire(txn, 0); // class
         dns_ttl_to_wire(txn, 0); // SIG RR TTL
         dns_rdlength_begin(txn);
-        dns_ui16_to_wire(txn, 0); // type = 0 for transaction signature
-        *txn->p++ = algorithm;
-        *txn->p++ = 0; // labels field doesn't apply for transaction signature
-        dns_ttl_to_wire(txn, 0); // ttl doesn't apply
-        dns_ui32_to_wire(txn, 0); // signature inception time is problematic
-        dns_ui32_to_wire(txn, 0); // signature
-        dns_ui16_to_wire(txn, 0); // key tag
+        start = txn->p;
+        dns_u16_to_wire(txn, 0); // type = 0 for transaction signature
+        dns_u8_to_wire(txn, srp_key_algorithm(key));
+        dns_u8_to_wire(txn, 0); // labels field doesn't apply for transaction signature
+        dns_ttl_to_wire(txn, 0); // original ttl doesn't apply
+#ifdef NO_CLOCK
+        dns_u32_to_wire(txn, 0); // Indicate that we have no clock: set expiry and inception times to zero
+        dns_u32_to_wire(txn, 0);
+#else        
+        gettimeofday(&now, NULL);
+        dns_u32_to_wire(txn, now.tv_sec + 300); // signature expiration time is five minutes from now
+        dns_u32_to_wire(txn, now.tv_sec - 300); // signature inception time, five minutes in the past
+#endif
+        dns_u16_to_wire(txn, key_tag);
+        p_signer = txn->p;
+        // We store the name in uncompressed form because that's what we have to sign
+        dns_full_name_to_wire(NULL, txn, signer_fqdn);
+        // And that means we're going to have to copy the signature back earlier in the packet.
+        p_signature = txn->p;
+
+        // Sign the message, signature RRDATA (less signature) first.
+        srp_sign(txn->p, siglen, (uint8_t *)txn->message, rrstart - (uint8_t *)txn->message,
+                 start, txn->p - start, key);
+
+        // Now that it's signed, back up and store the pointer to the name, because we're trying
+        // to be as compact as possible.
+        txn->p = p_signer;
         dns_ptr_to_wire(NULL, txn, signer); // Pointer to the owner name the key is attached to
-        memset(txn->p, 0xFA, 64); // XXX generate a signature! :)
-        txn->p += 64;
+        // And move the signature earlier in the packet.
+        memmove(txn->p, p_signature, siglen);
+
+        txn->p += siglen;
         dns_rdlength_end(txn);
     }
 }
@@ -416,7 +471,7 @@ dns_send_to_server(dns_transaction_t *NONNULL txn,
         struct sockaddr sa;
         struct sockaddr_in sin;
         struct sockaddr_in6 sin6;
-    } addr, myaddr, from;
+    } addr, from;
     socklen_t len, fromlen;
     ssize_t rv, datasize;
 
@@ -426,11 +481,11 @@ dns_send_to_server(dns_transaction_t *NONNULL txn,
         // Try IPv4 first because IPv6 addresses are never valid IPv4 addresses
         if (inet_pton(AF_INET, anycast_address, &addr.sin.sin_addr)) {
             addr.sin.sin_family = AF_INET;
-            addr.sin.sin_port = htons(53);
+            addr.sin.sin_port = htons(9999);
             len = sizeof addr.sin;
         } else if (inet_pton(AF_INET6, anycast_address, &addr.sin6.sin6_addr)) {
             addr.sin6.sin6_family = AF_INET6;
-            addr.sin6.sin6_port = htons(53);
+            addr.sin6.sin6_port = htons(9999);
             len = sizeof addr.sin6;
         } else {
             txn->error = EPROTONOSUPPORT;
@@ -446,6 +501,7 @@ dns_send_to_server(dns_transaction_t *NONNULL txn,
             return -1;
         }
 
+#if 0
         memset(&myaddr, 0, sizeof myaddr);
         myaddr.sin.sin_port = htons(9999);
         myaddr.sa.sa_len = len;
@@ -455,6 +511,7 @@ dns_send_to_server(dns_transaction_t *NONNULL txn,
             txn->error = errno;
             return -1;
         }
+#endif
 
         datasize = txn->p - ((u_int8_t *)txn->message);
         rv = sendto(txn->sock, txn->message, datasize, 0, &addr.sa, len);

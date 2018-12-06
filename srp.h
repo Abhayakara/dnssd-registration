@@ -1,4 +1,4 @@
-/* verify_mbedtls.c
+/* srp.h
  *
  * Copyright (c) 2018 Apple Computer, Inc. All rights reserved.
  *
@@ -14,29 +14,29 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * DNS SIG(0) signature verification for DNSSD SRP using mbedtls.
- *
- * Provides functions for generating a public key validating context based on SIG(0) KEY RR data, and
- * validating a signature using a context generated with that public key.  Currently only ECDSASHA256 is
- * supported.
+ * Service Registration Protocol common definitions
  */
 
-#include <stdio.h>
-#include <arpa/inet.h>
-#include <string.h>
-#include <stdlib.h>
+#ifndef __SRP_H
+#define __SRP_H
 
-#include <mbedtls/error.h>
-#include <mbedtls/pk.h>
-#include <mbedtls/ecdsa.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
+#include <stdint.h>
+#include <stdbool.h>
 
-#include "dns-msg.h"
+#ifdef __clang__
+#define NULLABLE _Nullable
+#define NONNULL _Nonnull
+#else
+#define NULLABLE
+#define NONNULL
+#endif
 
-// Construct a DER file from the binary part of the key
-// Use the DER file to generate a public key
-// Given a DNS message and a public key, validate the message
+#define ERROR(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define INFO(fmt, ...)  fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define DEBUG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+
+typedef struct srp_key srp_key_t;
+#endif
 
 // Local Variables:
 // mode: C

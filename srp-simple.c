@@ -25,7 +25,10 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <stdlib.h>
+
+#include "srp.h"
 #include "dns-msg.h"
+#include "srp-crypto.h"
 
 static void
 dns_response_callback(dns_transaction_t *txn)
@@ -36,23 +39,38 @@ int
 main(int argc, char **argv)
 {
     const char *host_name = "thread-demo";
+    const char *zone_name = "default.service.arpa";
+    const char *host_fqdn = "thread-demo.default.service.arpa";
     const char *service_type = "_ipps._tcp";
     const char *a_record = "127.0.0.1";
     const char *aaaa_record = "::1";
     const char *txt_record = "0";
-    const char *anycast_address = "127.0.0.1";
+//    const char *anycast_address = "127.0.0.1";
+    const char *anycast_address = "73.186.137.119"; // cer.fugue.com
+    const char *keyfile_name = "srp-simple.key";
     int port = 9992;
-    int private_key_len = 0;
-    int public_key_len = 0;
-    uint8_t *private_key = NULL;
-    uint8_t *public_key = NULL;
+    srp_key_t *key;
     dns_wire_t message, response;
+    uint16_t key_tag;
     static dns_transaction_t txn;
     dns_name_pointer_t p_host_name;
     dns_name_pointer_t p_zone_name;
     dns_name_pointer_t p_service_name;
     dns_name_pointer_t p_service_instance_name;
     int line;
+
+    key = srp_load_keypair(keyfile_name);
+    if (key == NULL) {
+        key = srp_generate_key();
+        if (key == NULL) {
+            printf("Unable to load or generate a key.");
+            exit(1);
+        }
+        if (!srp_write_key_to_file(keyfile_name, key)) {
+            printf("Unable to safe generated key.");
+            exit(1);
+        }
+    }
 
 #define CH if (txn.error) { line = __LINE__; goto fail; }
 
@@ -66,7 +84,6 @@ main(int argc, char **argv)
     message.bitfield = 0;
     dns_qr_set(&message, dns_qr_query);
     dns_opcode_set(&message, dns_opcode_update);
-    message.bitfield = htons(message.bitfield);
 
     // Message data...
     memset(&txn, 0, sizeof txn);
@@ -80,9 +97,9 @@ main(int argc, char **argv)
     // Copy in Zone name (and save pointer)
     // ZTYPE = SOA
     // ZCLASS = IN
-    dns_full_name_to_wire(&p_zone_name, &txn, "default.service.arpa"); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_soa); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_in); CH;
+    dns_full_name_to_wire(&p_zone_name, &txn, zone_name); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_soa); CH;
+    dns_u16_to_wire(&txn, dns_qclass_in); CH;
 
     message.ancount = 0;
     // PRCOUNT = 0
@@ -99,10 +116,10 @@ main(int argc, char **argv)
     //      RDLENGTH = 0
     dns_name_to_wire(&p_host_name, &txn, host_name); CH;
     dns_ptr_to_wire(&p_host_name, &txn, &p_zone_name); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_any); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_any); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_any); CH;
+    dns_u16_to_wire(&txn, dns_qclass_any); CH;
     dns_ttl_to_wire(&txn, 0); CH;
-    dns_ui16_to_wire(&txn, 0); CH;
+    dns_u16_to_wire(&txn, 0); CH;
     message.nscount++;
     //  * Add either or both of an A or AAAA RRset, each of which contains one
     //    or more A or AAAA RRs.
@@ -113,8 +130,8 @@ main(int argc, char **argv)
     //      RDLENGTH = number of RRs * RR length (4 or 16)
     //      RDATA = <the data>
     dns_ptr_to_wire(NULL, &txn, &p_host_name); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_a); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_in); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_a); CH;
+    dns_u16_to_wire(&txn, dns_qclass_in); CH;
     dns_ttl_to_wire(&txn, 3600); CH;
     dns_rdlength_begin(&txn); CH;
     dns_rdata_a_to_wire(&txn, a_record); CH;
@@ -122,8 +139,8 @@ main(int argc, char **argv)
     message.nscount++;
     
     dns_ptr_to_wire(NULL, &txn, &p_host_name); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_aaaa); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_in); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_aaaa); CH;
+    dns_u16_to_wire(&txn, dns_qclass_in); CH;
     dns_ttl_to_wire(&txn, 3600); CH;
     dns_rdlength_begin(&txn); CH;
     dns_rdata_aaaa_to_wire(&txn, aaaa_record); CH;
@@ -138,11 +155,11 @@ main(int argc, char **argv)
     //      RDLENGTH = length of key + 4 (32 bits)
     //      RDATA = <flags(16) = 0000 0010 0000 0001, protocol(8) = 3, algorithm(8) = 8?, public key(variable)>
     dns_ptr_to_wire(NULL, &txn, &p_host_name); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_key); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_in); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_key); CH;
+    dns_u16_to_wire(&txn, dns_qclass_in); CH;
     dns_ttl_to_wire(&txn, 3600); CH;
     dns_rdlength_begin(&txn); CH;
-    dns_rdata_key_to_wire(&txn, 0, 2, 1, 3, 8, public_key, public_key_len); CH;
+    key_tag = dns_rdata_key_to_wire(&txn, 0, 2, 1, key); CH;
     dns_rdlength_end(&txn); CH;
     message.nscount++;
 
@@ -156,8 +173,8 @@ main(int argc, char **argv)
     //     RDATA = service instance name
     dns_name_to_wire(&p_service_name, &txn, service_type); CH;
     dns_ptr_to_wire(&p_service_name, &txn, &p_zone_name); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_ptr); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_in); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_ptr); CH;
+    dns_u16_to_wire(&txn, dns_qclass_in); CH;
     dns_ttl_to_wire(&txn, 3600); CH;
     dns_rdlength_begin(&txn); CH;
     dns_name_to_wire(&p_service_instance_name, &txn, host_name); CH;
@@ -173,10 +190,10 @@ main(int argc, char **argv)
     //      TTL = 0
     //      RDLENGTH = 0
     dns_ptr_to_wire(NULL, &txn, &p_service_instance_name); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_any); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_any); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_any); CH;
+    dns_u16_to_wire(&txn, dns_qclass_any); CH;
     dns_ttl_to_wire(&txn, 0); CH;
-    dns_ui16_to_wire(&txn, 0); CH;
+    dns_u16_to_wire(&txn, 0); CH;
     message.nscount++;
 
     //   * Add one SRV RRset pointing to Host Description
@@ -187,13 +204,13 @@ main(int argc, char **argv)
     //      RDLENGTH = 8
     //      RDATA = <priority(16) = 0, weight(16) = 0, port(16) = service port, target = pointer to hostname>
     dns_ptr_to_wire(NULL, &txn, &p_service_instance_name); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_srv); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_in); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_srv); CH;
+    dns_u16_to_wire(&txn, dns_qclass_in); CH;
     dns_ttl_to_wire(&txn, 3600); CH;
     dns_rdlength_begin(&txn); CH;
-    dns_ui16_to_wire(&txn, 0); // priority CH;
-    dns_ui16_to_wire(&txn, 0); // weight CH;
-    dns_ui16_to_wire(&txn, port); // port CH;
+    dns_u16_to_wire(&txn, 0); // priority CH;
+    dns_u16_to_wire(&txn, 0); // weight CH;
+    dns_u16_to_wire(&txn, port); // port CH;
     dns_ptr_to_wire(NULL, &txn, &p_host_name); CH;
     dns_rdlength_end(&txn); CH;
     message.nscount++;
@@ -206,8 +223,8 @@ main(int argc, char **argv)
     //      RDLENGTH = <length of text>
     //      RDATA = <text>
     dns_ptr_to_wire(NULL, &txn, &p_service_instance_name); CH;
-    dns_ui16_to_wire(&txn, dns_rrtype_txt); CH;
-    dns_ui16_to_wire(&txn, dns_qclass_in); CH;
+    dns_u16_to_wire(&txn, dns_rrtype_txt); CH;
+    dns_u16_to_wire(&txn, dns_qclass_in); CH;
     dns_ttl_to_wire(&txn, 3600); CH;
     dns_rdlength_begin(&txn); CH;
     dns_rdata_txt_to_wire(&txn, txt_record); CH;
@@ -222,17 +239,19 @@ main(int argc, char **argv)
     //     ...
     //   SIG(0)
     
-    message.arcount = htons(2);
-    dns_edns0_header_to_wire(&txn, DNS_MAX_UDP_PAYLOAD, 0, 0, 1); CH;	// XRCODE = 0; VERSION = 0; DO=1
+    message.arcount = htons(1);
+    dns_edns0_header_to_wire(&txn, DNS_MAX_UDP_PAYLOAD, 0, 0, 1); CH;   // XRCODE = 0; VERSION = 0; DO=1
     dns_rdlength_begin(&txn); CH;
-    dns_ui16_to_wire(&txn, dns_opt_update_lease); CH;  // OPTION-CODE
+    dns_u16_to_wire(&txn, dns_opt_update_lease); CH;  // OPTION-CODE
     dns_edns0_option_begin(&txn); CH;                 // OPTION-LENGTH
-    dns_ui32_to_wire(&txn, 3600); CH;                  // LEASE (1 hour)
-    dns_ui32_to_wire(&txn, 604800); CH;                // KEY-LEASE (7 days)
+    dns_u32_to_wire(&txn, 3600); CH;                  // LEASE (1 hour)
+    dns_u32_to_wire(&txn, 604800); CH;                // KEY-LEASE (7 days)
     dns_edns0_option_end(&txn); CH;                   // Now we know OPTION-LENGTH
     dns_rdlength_end(&txn); CH;
 
-    dns_sig0_signature_to_wire(&txn, 8, private_key, private_key_len, &p_host_name); CH;
+    dns_sig0_signature_to_wire(&txn, key, key_tag, &p_host_name, host_fqdn); CH;
+    // The signature is computed before counting the signature RR in the header counts.
+    message.arcount = htons(ntohs(message.arcount) + 1);
 
     // Send the update
     if (dns_send_to_server(&txn, anycast_address, dns_response_callback) < 0) {

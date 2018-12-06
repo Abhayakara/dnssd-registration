@@ -18,17 +18,13 @@
  * Definitions...
  */
 
-#include <stdint.h>
-#include <stdbool.h>
-
-#ifdef __clang__
-#define NULLABLE _Nullable
-#define NONNULL _Nonnull
-#endif
+#ifndef __DNS_MSG_H
+#define __DNS_MSG_H
 
 #ifndef DNS_MAX_UDP_PAYLOAD
 #define DNS_MAX_UDP_PAYLOAD 1410
 #endif
+
 #define DNS_HEADER_SIZE      12
 #define DNS_DATA_SIZE        (DNS_MAX_UDP_PAYLOAD - DNS_HEADER_SIZE)
 #define DNS_MAX_POINTER      ((2 << 14) - 1)
@@ -48,7 +44,7 @@ struct dns_wire {
 
 typedef struct dns_transaction dns_transaction_t;
 struct dns_transaction {
-    dns_transaction_t * NULLABLE next;
+    dns_transaction_t *NULLABLE next;
     dns_wire_t *NULLABLE message;
     dns_wire_t *NULLABLE response;
     uint8_t *NONNULL p;
@@ -85,7 +81,7 @@ struct dns_txt_element {
     char data[0];
 };
 
-typedef struct dns_rrset dns_rrset_t;
+typedef struct dns_rrset dns_rr_t;
 struct dns_rrset {
     dns_label_t *NONNULL name;
     uint16_t type;
@@ -114,6 +110,26 @@ struct dns_rrset {
             uint16_t port;
         } srv;
         dns_txt_element_t *NONNULL txt;
+        struct {
+            uint16_t type;
+            uint8_t algorithm;
+            uint8_t label;
+            uint32_t rrttl;
+            uint32_t expiry;
+            uint32_t inception;
+            uint16_t key_tag;
+            dns_label_t *NONNULL signer;
+            int start, hdrlen;
+            int len;
+            uint8_t *NONNULL signature;
+        } sig;
+        struct {
+            uint16_t flags;
+            uint8_t protocol;
+            uint8_t algorithm;
+            int len;
+            uint8_t *NONNULL key;
+        } key;
     } data;
 };
 
@@ -126,11 +142,12 @@ struct dns_edns0 {
 
 typedef struct dns_message dns_message_t;
 struct dns_message {
+    dns_wire_t *NULLABLE wire;
     int qdcount, ancount, nscount, arcount;
-    dns_rrset_t *NULLABLE questions;
-    dns_rrset_t *NULLABLE answers;
-    dns_rrset_t *NULLABLE authority;
-    dns_rrset_t *NULLABLE additional;
+    dns_rr_t *NULLABLE questions;
+    dns_rr_t *NULLABLE answers;
+    dns_rr_t *NULLABLE authority;
+    dns_rr_t *NULLABLE additional;
     dns_edns0_t *NULLABLE edns0;
 };
 
@@ -154,15 +171,17 @@ struct dns_message {
 #define dns_flags_cd 0x0010
 
 // Getters
-#define dns_qr_get(w) (((w)->bitfield & dns_qr_mask) >> dns_qr_shift)
-#define dns_opcode_get(w) (((w)->bitfield & dns_opcode_mask) >> dns_opcode_shift)
-#define dns_rcode_get(w) (((w)->bitfield & dns_rcode_mask) >> dns_rcode_shift)
+#define dns_qr_get(w) ((ntohs((w)->bitfield) & dns_qr_mask) >> dns_qr_shift)
+#define dns_opcode_get(w) ((ntohs((w)->bitfield) & dns_opcode_mask) >> dns_opcode_shift)
+#define dns_rcode_get(w) ((ntohs((w)->bitfield) & dns_rcode_mask) >> dns_rcode_shift)
 
 // Setters
-#define dns_qr_set(w, value) ((w)->bitfield = (((w)->bitfield & ~dns_qr_mask) | ((value) << dns_qr_shift)))
-#define dns_opcode_set(w, value) ((w)->bitfield = (((w)->bitfield & ~dns_opcode_mask) | \
-                                                    ((value) << dns_opcode_shift)))
-#define dns_rcode_set(w, value) ((w)->bitfield = (((w)->bitfield & ~dns_rcode_mask) | ((value) << dns_rcode_shift)))
+#define dns_qr_set(w, value) ((w)->bitfield = htons(((ntohs((w)->bitfield) & ~dns_qr_mask) | \
+                                                     ((value) << dns_qr_shift))))
+#define dns_opcode_set(w, value) ((w)->bitfield = htons(((ntohs((w)->bitfield) & ~dns_opcode_mask) | \
+                                                         ((value) << dns_opcode_shift))))
+#define dns_rcode_set(w, value) ((w)->bitfield = htons(((ntohs((w)->bitfield) & ~dns_rcode_mask) | \
+                                                        ((value) << dns_rcode_shift))))
 
 // Query/Response
 #define dns_qr_query           0
@@ -302,10 +321,6 @@ struct dns_message {
 #define dns_opt_chain         13 // [RFC7901]
 #define dns_opt_key_tag       14 // [RFC8145]
 
-#define ERROR(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
-#define INFO(fmt, ...)  fprintf(stderr, fmt "\n", ##__VA_ARGS__)
-#define DEBUG(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
-
 // towire.c:
 
 uint16_t srp_random16(void);
@@ -322,9 +337,11 @@ void dns_name_plus_ptr_to_wire(dns_name_pointer_t *NULLABLE r_pointer,
 void dns_ptr_to_wire(dns_name_pointer_t *NULLABLE r_pointer,
                      dns_transaction_t *NONNULL txn,
                      dns_name_pointer_t *NONNULL pointer);
-void dns_ui16_to_wire(dns_transaction_t *NONNULL txn,
+void dns_u8_to_wire(dns_transaction_t *NONNULL txn,
+                    uint8_t val);
+void dns_u16_to_wire(dns_transaction_t *NONNULL txn,
                       uint16_t val);
-void dns_ui32_to_wire(dns_transaction_t *NONNULL txn,
+void dns_u32_to_wire(dns_transaction_t *NONNULL txn,
                       uint32_t val);
 void dns_ttl_to_wire(dns_transaction_t *NONNULL txn,
                      int32_t val);
@@ -334,14 +351,11 @@ void dns_rdata_a_to_wire(dns_transaction_t *NONNULL txn,
                          const char *NONNULL ip_address);
 void dns_rdata_aaaa_to_wire(dns_transaction_t *NONNULL txn,
                             const char *NONNULL ip_address);
-void dns_rdata_key_to_wire(dns_transaction_t *NONNULL txn,
-                           unsigned key_type,
-                           unsigned name_type,
-                           unsigned signatory,
-                           unsigned protocol,
-                           unsigned algorithm,
-                           uint8_t *NONNULL key,
-                           int key_len);
+uint16_t dns_rdata_key_to_wire(dns_transaction_t *NONNULL txn,
+                               unsigned key_type,
+                               unsigned name_type,
+                               unsigned signatory,
+                               srp_key_t *NONNULL key);
 void dns_rdata_txt_to_wire(dns_transaction_t *NONNULL txn,
                            const char *NONNULL txt_record);
 void dns_edns0_header_to_wire(dns_transaction_t *NONNULL txn,
@@ -352,25 +366,26 @@ void dns_edns0_header_to_wire(dns_transaction_t *NONNULL txn,
 void dns_edns0_option_begin(dns_transaction_t *NONNULL txn);
 void dns_edns0_option_end(dns_transaction_t *NONNULL txn);
 void dns_sig0_signature_to_wire(dns_transaction_t *NONNULL txn,
-                                unsigned algorithm,
-                                const uint8_t *NONNULL private_key,
-                                int private_key_len,
-                                dns_name_pointer_t *NONNULL signer);
+                                srp_key_t *NONNULL key, uint16_t key_tag,
+                                dns_name_pointer_t *NONNULL signer,
+                                const char *NONNULL signer_fqdn);
 int dns_send_to_server(dns_transaction_t *NONNULL txn,
                        const char *NONNULL anycast_address,
                        dns_response_callback_t NONNULL callback);
 
 // fromwire.c:
 dns_label_t * NULLABLE dns_label_parse(dns_wire_t *NONNULL message, unsigned mlen, unsigned *NONNULL offp);
-bool dns_opt_parse(dns_edns0_t *NONNULL *NULLABLE ret, dns_rrset_t *NONNULL rrset);
+bool dns_opt_parse(dns_edns0_t *NONNULL *NULLABLE ret, dns_rr_t *NONNULL rrset);
 bool dns_name_parse(dns_label_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message, unsigned len,
                     unsigned *NONNULL offp, unsigned base);
-bool dns_rr_parse(dns_rrset_t *NONNULL rrset,
+bool dns_rr_parse(dns_rr_t *NONNULL rrset,
                   dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp, bool rrdata_permitted);
 bool dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message, unsigned len);
 bool dns_names_equal(dns_label_t *NONNULL name1, dns_label_t *NONNULL name2);
 const char *NONNULL dns_name_print(dns_name_t *NONNULL name, char *NONNULL buf, int bufmax);
 bool dns_names_equal_text(dns_label_t *NONNULL name1, const char *NONNULL name2);
+
+#endif // _DNS_MSG_H
 
 // Local Variables:
 // mode: C
