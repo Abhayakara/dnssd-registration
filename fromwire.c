@@ -475,7 +475,7 @@ void dns_name_free(dns_label_t *name)
     return dns_name_free(next);
 }    
 
-static void
+void
 dns_rrdata_free(dns_rr_t *rr)
 {
     switch(rr->type) {
@@ -545,7 +545,7 @@ dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message
     }
     
 #define PARSE(count, sets, name, rrdata_expected)                                   \
-    rv->count = htons(message->count);                                              \
+    rv->count = ntohs(message->count);                                              \
     if (rv->count > 50) {                                                           \
         dns_message_free(rv);                                                       \
         return false;                                                               \

@@ -81,8 +81,8 @@ struct dns_txt_element {
     char data[0];
 };
 
-typedef struct dns_rrset dns_rr_t;
-struct dns_rrset {
+typedef struct dns_rr dns_rr_t;
+struct dns_rr {
     dns_label_t *NONNULL name;
     uint16_t type;
     uint16_t qclass;
@@ -380,6 +380,9 @@ bool dns_name_parse(dns_label_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL mess
                     unsigned *NONNULL offp, unsigned base);
 bool dns_rr_parse(dns_rr_t *NONNULL rrset,
                   dns_wire_t *NONNULL message, unsigned len, unsigned *NONNULL offp, bool rrdata_permitted);
+void dns_name_free(dns_label_t *NONNULL name);
+void dns_rrdata_free(dns_rr_t *NONNULL rr);
+void dns_message_free(dns_message_t *NONNULL message);
 bool dns_wire_parse(dns_message_t *NONNULL *NULLABLE ret, dns_wire_t *NONNULL message, unsigned len);
 bool dns_names_equal(dns_label_t *NONNULL name1, dns_label_t *NONNULL name2);
 const char *NONNULL dns_name_print(dns_name_t *NONNULL name, char *NONNULL buf, int bufmax);

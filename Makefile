@@ -10,7 +10,7 @@ clean:
 
 srp-simple:	towire.o srp-simple.o sign-mbedtls.o
 
-srp-gw:	srp-gw.o towire.o fromwire.o sign-mbedtls.o verify-mbedtls.o
+srp-gw:	srp-gw.o towire.o fromwire.o sign-mbedtls.o verify-mbedtls.o ioloop.o dnssd-proxy.o
 
 keydump:	keydump.o fromwire.o sign-mbedtls.o verify-mbedtls.o
 
